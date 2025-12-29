@@ -62,6 +62,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #endif
 
 #include "ggml-impl.h"
+#include "ggml-common.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-vulkan-shaders.hpp"

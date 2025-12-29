@@ -10,6 +10,9 @@ extern "C" {
 #define GGML_VK_NAME "Vulkan"
 #define GGML_VK_MAX_DEVICES 16
 
+#define GGML_COMMON_DECL_VK
+#define GGML_COMMON_DECL_CPP
+
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_vk_init(size_t dev_num);
 
