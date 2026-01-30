@@ -5656,6 +5656,27 @@ static void ggml_vk_instance_init() {
 
         ggml_vk_print_gpu_info(i);
     }
+
+    // Enumerate and print physical device groups
+    std::vector<vk::PhysicalDeviceGroupProperties> device_groups = vk_instance.instance.enumeratePhysicalDeviceGroups();
+    if (device_groups.size() > 1 || (device_groups.size() == 1 && device_groups[0].physicalDeviceCount > 1)) {
+        GGML_LOG_DEBUG("ggml_vulkan: Found %zu Vulkan device group(s):\n", device_groups.size());
+        for (size_t g = 0; g < device_groups.size(); g++) {
+            const auto& group = device_groups[g];
+            std::string group_devices;
+            for (uint32_t d = 0; d < group.physicalDeviceCount; d++) {
+                vk::PhysicalDeviceProperties props = group.physicalDevices[d].getProperties();
+                if (d > 0) {
+                    group_devices += ", ";
+                }
+                group_devices += props.deviceName.data();
+            }
+            GGML_LOG_DEBUG("ggml_vulkan:   Group %zu: %u device(s), subsetAllocation=%s: [%s]\n",
+                g, group.physicalDeviceCount,
+                group.subsetAllocation ? "true" : "false",
+                group_devices.c_str());
+        }
+    }
 }
 
 static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
