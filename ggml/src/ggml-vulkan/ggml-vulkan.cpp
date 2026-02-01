@@ -5693,7 +5693,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
 #endif
 }
 
-static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type type) {
+static vk_pipeline ggml_vk_get_to_fp16(vk_device& device, ggml_type type) {
     VK_LOG_DEBUG("ggml_vk_get_to_fp16()");
     switch (type) {
         case GGML_TYPE_F32:
@@ -5722,7 +5722,7 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
             return nullptr;
     }
 
-    return ctx->device->pipeline_dequant[type];
+    return device->pipeline_dequant[type];
 }
 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec) {
@@ -7100,12 +7100,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     if (x_non_contig) {
         to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
     } else {
-        to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
+        to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx->device, src0->type);
     }
     if (y_non_contig) {
         to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, f16_type);
     } else {
-        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
+        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
@@ -7370,7 +7370,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     if (y_non_contig) {
         to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, src1->type);
     } else {
-        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
+        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
 
     // Check for mmq first
@@ -7916,12 +7916,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (x_non_contig) {
         to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
     } else {
-        to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx, src0->type);
+        to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx->device, src0->type);
     }
     if (y_non_contig) {
         to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, f16_type);
     } else {
-        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
+        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
@@ -8136,7 +8136,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     if (y_non_contig) {
         to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, src1->type);
     } else {
-        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
+        to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
 
     // Check for mmq first
@@ -11685,7 +11685,7 @@ static void ggml_vk_test_dequant(ggml_backend_vk_context * ctx, size_t ne, ggml_
         x[i] = rand() / (float)RAND_MAX;
     }
 
-    vk_pipeline p = ggml_vk_get_to_fp16(ctx, quant);
+    vk_pipeline p = ggml_vk_get_to_fp16(ctx->device, quant);
 
     ggml_vk_quantize_data(x, qx, ne, quant);
     ggml_vk_dequantize_data(qx, x_ref, ne, quant);
