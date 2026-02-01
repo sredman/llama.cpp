@@ -6801,7 +6801,7 @@ static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
         (tensor->ne[3] == 1 || tensor->nb[3] == tensor->nb[2]*tensor->ne[2]);
 }
 
-static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src, const ggml_tensor * dst, ggml_type to) {
+static vk_pipeline ggml_vk_get_cpy_pipeline(vk_device& device, const ggml_tensor * src, const ggml_tensor * dst, ggml_type to) {
 
     // Choose "contiguous copy" shader if src/dst are contiguous
     bool contig = ggml_is_contiguous(src) && (!dst || ggml_is_contiguous(dst));
@@ -6811,59 +6811,59 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
 
     if (transpose && src->type == to) {
         if (ggml_type_size(to) == 4) {
-            return ctx->device->pipeline_cpy_transpose_32;
+            return device->pipeline_cpy_transpose_32;
         } else if (ggml_type_size(to) == 2) {
-            return ctx->device->pipeline_cpy_transpose_16;
+            return device->pipeline_cpy_transpose_16;
         }
     }
 
     if (src->type == GGML_TYPE_F32 && to == GGML_TYPE_F32) {
         if (contig) {
-            return ctx->device->pipeline_contig_cpy_f32_f32;
+            return device->pipeline_contig_cpy_f32_f32;
         } else {
-            return ctx->device->pipeline_cpy_f32_f32;
+            return device->pipeline_cpy_f32_f32;
         }
     }
     if (src->type == GGML_TYPE_F32 && to == GGML_TYPE_F16) {
         if (contig) {
-            return ctx->device->pipeline_contig_cpy_f32_f16;
+            return device->pipeline_contig_cpy_f32_f16;
         } else {
-            return ctx->device->pipeline_cpy_f32_f16;
+            return device->pipeline_cpy_f32_f16;
         }
     }
     if (src->type == GGML_TYPE_F16 && to == GGML_TYPE_F16) {
         if (contig) {
-            return ctx->device->pipeline_contig_cpy_f16_f16;
+            return device->pipeline_contig_cpy_f16_f16;
         } else {
-            return ctx->device->pipeline_cpy_f16_f16;
+            return device->pipeline_cpy_f16_f16;
         }
     }
     if (src->type == GGML_TYPE_F16 && to == GGML_TYPE_F32) {
         if (contig) {
-            return ctx->device->pipeline_contig_cpy_f16_f32;
+            return device->pipeline_contig_cpy_f16_f32;
         } else {
-            return ctx->device->pipeline_cpy_f16_f32;
+            return device->pipeline_cpy_f16_f32;
         }
     }
     if (src->type == GGML_TYPE_F32 && to == GGML_TYPE_BF16) {
         if (contig) {
-            return ctx->device->pipeline_contig_cpy_f32_bf16;
+            return device->pipeline_contig_cpy_f32_bf16;
         } else {
-            return ctx->device->pipeline_cpy_f32_bf16;
+            return device->pipeline_cpy_f32_bf16;
         }
     }
     if (src->type == GGML_TYPE_F32 && to == GGML_TYPE_I32) {
         if (contig) {
-            return ctx->device->pipeline_contig_cpy_f32_i32;
+            return device->pipeline_contig_cpy_f32_i32;
         } else {
-            return ctx->device->pipeline_cpy_f32_i32;
+            return device->pipeline_cpy_f32_i32;
         }
     }
     if (src->type == GGML_TYPE_I32 && to == GGML_TYPE_F32) {
         if (contig) {
-            return ctx->device->pipeline_contig_cpy_i32_f32;
+            return device->pipeline_contig_cpy_i32_f32;
         } else {
-            return ctx->device->pipeline_cpy_i32_f32;
+            return device->pipeline_cpy_i32_f32;
         }
     }
     if (src->type == GGML_TYPE_F32) {
@@ -6874,7 +6874,7 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
-            return ctx->device->pipeline_cpy_f32_quant[to];
+            return device->pipeline_cpy_f32_quant[to];
         default:
             break;
         }
@@ -6888,7 +6888,7 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
-            return ctx->device->pipeline_cpy_quant_f32[src->type];
+            return device->pipeline_cpy_quant_f32[src->type];
         default:
             break;
         }
@@ -6902,15 +6902,15 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         GGML_ASSERT(ggml_is_quantized(to) || ggml_type_size(src->type) == 2 || ggml_type_size(src->type) == 4);
         if ((ggml_type_size(src->type) % 4) == 0) {
             if (contig) {
-                return ctx->device->pipeline_contig_cpy_f32_f32;
+                return device->pipeline_contig_cpy_f32_f32;
             } else {
-                return ctx->device->pipeline_cpy_f32_f32;
+                return device->pipeline_cpy_f32_f32;
             }
         } else {
             if (contig) {
-                return ctx->device->pipeline_contig_cpy_f16_f16;
+                return device->pipeline_contig_cpy_f16_f16;
             } else {
-                return ctx->device->pipeline_cpy_f16_f16;
+                return device->pipeline_cpy_f16_f16;
             }
         }
     }
@@ -7098,12 +7098,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     vk_pipeline to_q8_1 = nullptr;
 
     if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx->device, src0, nullptr, f16_type);
     } else {
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx->device, src0->type);
     }
     if (y_non_contig) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, f16_type);
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx->device, src1, nullptr, f16_type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
@@ -7365,10 +7365,10 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
     if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, src0->type);
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx->device, src0, nullptr, src0->type);
     }
     if (y_non_contig) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, src1->type);
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx->device, src1, nullptr, src1->type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
@@ -7914,12 +7914,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     vk_pipeline to_q8_1 = nullptr;
 
     if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, f16_type);
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx->device, src0, nullptr, f16_type);
     } else {
         to_fp16_vk_0 = ggml_vk_get_to_fp16(ctx->device, src0->type);
     }
     if (y_non_contig) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, f16_type);
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx->device, src1, nullptr, f16_type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
@@ -8131,10 +8131,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     vk_pipeline to_fp16_vk_0 = nullptr;
     vk_pipeline to_fp16_vk_1 = nullptr;
     if (x_non_contig) {
-        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, src0->type);
+        to_fp16_vk_0 = ggml_vk_get_cpy_pipeline(ctx->device, src0, nullptr, src0->type);
     }
     if (y_non_contig) {
-        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx, src1, nullptr, src1->type);
+        to_fp16_vk_1 = ggml_vk_get_cpy_pipeline(ctx->device, src1, nullptr, src1->type);
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx->device, src1->type);
     }
@@ -8866,7 +8866,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
-        return ggml_vk_get_cpy_pipeline(ctx, src0, dst, dst->type);
+        return ggml_vk_get_cpy_pipeline(ctx->device, src0, dst, dst->type);
     case GGML_OP_SET_ROWS:
         if (src1->type == GGML_TYPE_I64) {
             return ctx->device->pipeline_set_rows_i64[dst->type];
