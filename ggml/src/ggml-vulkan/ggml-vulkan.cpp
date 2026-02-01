@@ -897,13 +897,24 @@ struct vk_subbuffer {
 };
 
 // vk_event is used for the event-related backend interfaces. It uses 'event' for
+// backend_vk_event is used for the event-related backend interfaces. It uses 'event' for
 // event_wait and 'fence' for event_synchronize. Polling on an event for
 // event_synchronize wouldn't be sufficient to wait for command buffers to complete,
 // and would lead to validation errors.
-struct vk_event {
+struct backend_vk_event {
     vk::Event event;
     vk::Fence fence;
 };
+
+struct vk_event_struct {
+    vk::Event e;
+    const vk_device device; // The device this event was created on (needed for cleanup)
+
+    vk_event_struct(vk::Event event, vk_device dev)
+        : e(event), device(dev) {}
+};
+typedef std::shared_ptr<vk_event_struct> vk_event;
+typedef std::weak_ptr<vk_event_struct> vk_event_ref;
 
 struct vk_semaphore {
     vk::Semaphore s;
@@ -1562,7 +1573,7 @@ typedef std::weak_ptr<vk_context_struct> vk_context_ref;
 struct ggml_vk_garbage_collector {
     std::vector<vk_semaphore> tl_semaphores;
     std::vector<vk_semaphore> semaphores;
-    std::vector<vk::Event> events;
+    std::vector<vk_event> events;
     std::vector<vk_context> contexts;
 };
 
@@ -2403,11 +2414,35 @@ static vk_semaphore * ggml_vk_create_timeline_semaphore(ggml_backend_vk_context 
     return &ctx->gc.tl_semaphores[ctx->semaphore_idx++];
 }
 
-static vk::Event ggml_vk_create_event(ggml_backend_vk_context * ctx) {
+static vk_event ggml_vk_create_event(ggml_backend_vk_context * ctx, const vk_device& device) {
+    vk::Event e = device->device.createEvent({});
+    vk_event vk_e = std::make_shared<vk_event_struct>(e, device);
     if (ctx->event_idx >= ctx->gc.events.size()) {
-        ctx->gc.events.push_back(ctx->device->device.createEvent({}));
+        ctx->gc.events.push_back(vk_e);
     }
-    return ctx->gc.events[ctx->event_idx++];
+    return vk_e;
+}
+
+static void ggml_vk_event_await(vk_context& subctx, vk_event& event) {
+    VK_LOG_DEBUG("ggml_vk_event_await(" << event << ")");
+
+    subctx->s->buffer.waitEvents(
+        { event->e },
+        subctx->p->q->stage_flags,
+        subctx->p->q->stage_flags,
+        {},
+        {},
+        {}
+    );
+}
+
+static void ggml_vk_event_signal(vk_context& subctx, const vk_event& event) {
+    VK_LOG_DEBUG("ggml_vk_event_signal(" << event << ")");
+
+    subctx->s->buffer.setEvent(
+        event->e,
+        subctx->p->q->stage_flags
+    );
 }
 
 static void ggml_vk_command_pool_cleanup(vk_device& device, vk_command_pool& p) {
@@ -2688,8 +2723,8 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     );
 }
 
-static void ggml_vk_set_event(vk_context& ctx, vk::Event& event) {
-    VK_LOG_DEBUG("ggml_vk_set_event()");
+static void ggml_backend_vk_set_event(vk_context& ctx, vk::Event& event) {
+    VK_LOG_DEBUG("ggml_backend_vk_set_event()");
 
     ctx->s->buffer.setEvent(
         event,
@@ -2697,8 +2732,8 @@ static void ggml_vk_set_event(vk_context& ctx, vk::Event& event) {
     );
 }
 
-static void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events) {
-    VK_LOG_DEBUG("ggml_vk_wait_events()");
+static void ggml_backend_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events) {
+    VK_LOG_DEBUG("ggml_backend_vk_wait_events()");
     if (events.empty()) {
         return;
     }
@@ -12808,7 +12843,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->event_idx = 0;
 
     for (auto& event : ctx->gc.events) {
-        ctx->device->device.resetEvent(event);
+        event->device->device.destroyEvent(event->e);
     }
 
     ctx->tensor_ctxs.clear();
@@ -12840,7 +12875,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_split_k = 0;
 
     for (auto& event : ctx->gc.events) {
-        ctx->device->device.destroyEvent(event);
+        ctx->device->device.destroyEvent(event->e);
     }
     ctx->gc.events.clear();
 
@@ -14210,7 +14245,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
 static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     VK_LOG_DEBUG("ggml_backend_vk_event_record(backend=" << backend << ", event=" << event << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    vk_event *vkev = (vk_event *)event->context;
+    backend_vk_event *vkev = (backend_vk_event *)event->context;
 
     vk_context compute_ctx;
 
@@ -14228,7 +14263,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
     ctx->device->device.resetEvent(vkev->event);
     ctx->device->device.resetFences({ vkev->fence });
 
-    ggml_vk_set_event(compute_ctx, vkev->event);
+    ggml_backend_vk_set_event(compute_ctx, vkev->event);
 
     ggml_vk_ctx_end(compute_ctx);
 
@@ -14240,7 +14275,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
 static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     VK_LOG_DEBUG("ggml_backend_vk_event_wait(backend=" << backend << ", event=" << event << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    vk_event *vkev = (vk_event *)event->context;
+    backend_vk_event *vkev = (backend_vk_event *)event->context;
 
     vk_context compute_ctx;
 
@@ -14253,7 +14288,7 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
         compute_ctx = ctx->compute_ctx.lock();
     }
 
-    ggml_vk_wait_events(compute_ctx, {vkev->event});
+    ggml_backend_vk_wait_events(compute_ctx, {vkev->event});
     ggml_vk_ctx_end(compute_ctx);
     ctx->compute_ctx.reset();
 }
@@ -15005,7 +15040,7 @@ static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t 
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
 
-    vk_event *vkev = new vk_event;
+    backend_vk_event *vkev = new backend_vk_event;
     if (!vkev) {
         return nullptr;
     }
@@ -15025,7 +15060,7 @@ static void ggml_backend_vk_device_event_free(ggml_backend_dev_t dev, ggml_backe
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
 
-    vk_event *vkev = (vk_event *)event->context;
+    backend_vk_event *vkev = (backend_vk_event *)event->context;
 
     device->device.destroyFence(vkev->fence);
     device->device.destroyEvent(vkev->event);
@@ -15037,7 +15072,7 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
     VK_LOG_DEBUG("ggml_backend_vk_device_event_synchronize(backend=" << dev << ", event=" << event << ")");
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
-    vk_event *vkev = (vk_event *)event->context;
+    backend_vk_event *vkev = (backend_vk_event *)event->context;
 
     VK_CHECK(device->device.waitForFences({ vkev->fence }, true, UINT64_MAX), "event_synchronize");
 }
