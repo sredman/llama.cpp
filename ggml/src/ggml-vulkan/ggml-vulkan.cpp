@@ -44,6 +44,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 # include <windows.h>
 # define YIELD() YieldProcessor()
 #elif defined(__clang__) || defined(__GNUC__)
+# include <unistd.h>
 # if defined(__x86_64__) ||defined(__i386__)
 #  include <immintrin.h>
 #  define YIELD() _mm_pause()
@@ -624,6 +625,23 @@ struct vk_device_struct {
 
     bool pipeline_executable_properties_support {};
 
+    bool external_semaphore_support {};  // Whether this device supports the Vulkan extension for external semaphores
+
+    // Function pointers for external semaphore extension, loaded dynamically via vkGetDeviceProcAddr.
+    // These cannot be called directly (e.g., vkGetSemaphoreFdKHR(...)) because llama.cpp uses
+    // VULKAN_HPP_DISPATCH_LOADER_DYNAMIC which requires explicit function pointer loading.
+    // The dynamic dispatcher is only initialized at instance level (ggml_vk_instance_init), not
+    // per-device, so device-level extension functions like these are not available through the
+    // dispatcher. Other projects (e.g., Vulkan-Samples) that call these functions directly either
+    // use a static dispatcher or initialize per-device dispatchers.
+#if defined(_WIN32)
+    PFN_vkGetSemaphoreWin32HandleKHR pfn_vkGetSemaphoreWin32HandleKHR = nullptr;
+    PFN_vkImportSemaphoreWin32HandleKHR pfn_vkImportSemaphoreWin32HandleKHR = nullptr;
+#else
+    PFN_vkGetSemaphoreFdKHR pfn_vkGetSemaphoreFdKHR = nullptr;
+    PFN_vkImportSemaphoreFdKHR pfn_vkImportSemaphoreFdKHR = nullptr;
+#endif
+
     size_t idx;
 
     bool mul_mat_l[GGML_TYPE_COUNT];
@@ -905,13 +923,21 @@ struct vk_event {
     vk::Fence fence;
 };
 
+// Configuration for semaphore creation
+struct vk_semaphore_create_info {
+    const bool is_timeline = false;   // If true, create a timeline semaphore; if false, create a binary semaphore
+    const bool exportable = false;    // If true, create with export capability for cross-device use
+    const uint64_t initial_value = 0; // Initial value (only meaningful for timeline semaphores)
+};
+
 struct vk_semaphore_struct {
     vk::Semaphore s;        // Underlying semaphore object
     uint64_t value;         // The value used when signaling/waiting (only for timeline semaphores)
+    const bool exportable;  // True if this semaphore was created with export capability
     const vk_device device; // The device this semaphore was created on (needed for cleanup)
 
-    vk_semaphore_struct(vk::Semaphore semaphore, uint64_t initial_value, vk_device dev)
-        : s(semaphore), value(initial_value), device(dev) {}
+    vk_semaphore_struct(vk::Semaphore semaphore, uint64_t initial_value, bool is_exportable, vk_device dev)
+        : s(semaphore), value(initial_value), exportable(is_exportable), device(dev) {}
 };
 typedef std::shared_ptr<vk_semaphore_struct> vk_semaphore;
 
@@ -2386,28 +2412,146 @@ static vk_context ggml_vk_create_temporary_context(vk_command_pool& p) {
     return result;
 }
 
-static vk_semaphore ggml_vk_create_binary_semaphore(ggml_backend_vk_context * ctx) {
-    VK_LOG_DEBUG("ggml_vk_create_binary_semaphore()");
-    vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eBinary, 0 };
+// Helper to create a semaphore with the given configuration
+static vk_semaphore ggml_vk_create_semaphore(ggml_backend_vk_context * ctx, const vk_device& device, const vk_semaphore_create_info& info) {
+    VK_LOG_DEBUG("ggml_vk_create_semaphore(timeline=" << info.is_timeline << ", exportable=" << info.exportable << ")");
+    GGML_ASSERT((info.is_timeline || info.initial_value == 0) && "initial_value does not apply to binary sempahores.");
+
+    vk::SemaphoreType sem_type = info.is_timeline ? vk::SemaphoreType::eTimeline : vk::SemaphoreType::eBinary;
+    vk::SemaphoreTypeCreateInfo tci{ sem_type, info.initial_value };
+
     vk::SemaphoreCreateInfo ci{};
     ci.setPNext(&tci);
-    vk::Semaphore semaphore = ctx->device->device.createSemaphore(ci);
-    vk_semaphore sem = std::make_shared<vk_semaphore_struct>(semaphore, 0, ctx->device);
-    ctx->gc.semaphores.push_back(sem);
-    return sem;
+
+    // Chain export info if requested
+    // Note: We use SYNC_FD (not OPAQUE_FD) because OPAQUE_FD requires matching deviceUUID,
+    // which means it can only work between identical GPUs. SYNC_FD has no such restriction
+    // and works across different physical devices, but requires ensuring the signal for the semaphore
+    // is pending (or already happened) before export.
+    //
+    // WARNING: On Windows, there is NO equivalent to SYNC_FD - all Windows handle types
+    // (OPAQUE_WIN32, D3D12_FENCE) require matching deviceUUID. Cross-GPU semaphore sync
+    // is not possible on Windows using Vulkan external semaphores with different GPUs.
+    // The Windows path here only works for same-GPU multi-queue scenarios.
+    VkExportSemaphoreCreateInfo export_info{};
+    if (info.exportable) {
+        GGML_ASSERT(device->external_semaphore_support && "Device does not support external semaphores");
+        export_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+        export_info.pNext = ci.pNext;
+#if defined(_WIN32)
+        export_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#else
+        export_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+#endif
+        ci.pNext = &export_info;
+    }
+
+    vk::Semaphore semaphore = device->device.createSemaphore(ci);
+    vk_semaphore to_return = std::make_shared<vk_semaphore_struct>( semaphore, info.initial_value, info.exportable, device );
+
+    // Store in appropriate list based on semaphore type, including the device for proper cleanup
+    if (info.is_timeline) {
+        ctx->gc.tl_semaphores.push_back(to_return);
+    } else {
+        ctx->gc.semaphores.push_back(to_return);
+    }
+    return to_return;
 }
 
-static vk_semaphore ggml_vk_create_timeline_semaphore(ggml_backend_vk_context * ctx) {
-    VK_LOG_DEBUG("ggml_vk_create_timeline_semaphore()");
-    if (ctx->semaphore_idx >= ctx->gc.tl_semaphores.size()) {
-        vk::SemaphoreTypeCreateInfo tci{ vk::SemaphoreType::eTimeline, 0 };
-        vk::SemaphoreCreateInfo ci{};
-        ci.setPNext(&tci);
-        vk::Semaphore semaphore = ctx->device->device.createSemaphore(ci);
-        vk_semaphore sem = std::make_shared<vk_semaphore_struct>(semaphore, 0, ctx->device);
-        ctx->gc.tl_semaphores.push_back(sem);
+// Import a semaphore from another device for cross-device synchronization.
+// The source semaphore must have been created with exportable=true.
+// Returns a new semaphore handle valid on dst_device that refers to the same underlying sync object.
+static vk_semaphore ggml_vk_import_semaphore(ggml_backend_vk_context * ctx, const vk_device& dst_device, const vk_device& src_device, const vk_semaphore src_semaphore) {
+    VK_LOG_DEBUG("ggml_vk_import_semaphore(src_device=" << src_device->name << ", dst_device=" << dst_device->name << ")");
+
+    GGML_ASSERT(src_semaphore->exportable && "Cannot import a semaphore that was not created with exportable=true");
+    GGML_ASSERT(src_device->external_semaphore_support && "Source device does not support external semaphores");
+    GGML_ASSERT(dst_device->external_semaphore_support && "Destination device does not support external semaphores");
+
+#if defined(_WIN32)
+    GGML_ASSERT(src_device->pfn_vkGetSemaphoreWin32HandleKHR && "vkGetSemaphoreWin32HandleKHR not loaded");
+    GGML_ASSERT(dst_device->pfn_vkImportSemaphoreWin32HandleKHR && "vkImportSemaphoreWin32HandleKHR not loaded");
+
+    // Export handle from source device
+    // Note: OPAQUE_WIN32 requires matching deviceUUID, so this only works for same-GPU scenarios.
+    // Cross-GPU sync on Windows will fail at import time if devices differ.
+    VkSemaphoreGetWin32HandleInfoKHR get_handle_info{};
+    get_handle_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
+    get_handle_info.semaphore = src_semaphore->s;
+    get_handle_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+
+    HANDLE handle = nullptr;
+    VkResult result = src_device->pfn_vkGetSemaphoreWin32HandleKHR(src_device->device, &get_handle_info, &handle);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkGetSemaphoreWin32HandleKHR failed with VkResult %d\n", (int)result);
+        GGML_ABORT("vkGetSemaphoreWin32HandleKHR failed");
     }
-    return ctx->gc.tl_semaphores[ctx->semaphore_idx++];
+
+    // Create semaphore on destination device
+    vk::SemaphoreCreateInfo ci{};
+    vk::Semaphore dst_sem = dst_device->device.createSemaphore(ci);
+
+    // Import the handle
+    VkImportSemaphoreWin32HandleInfoKHR import_info{};
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR;
+    import_info.semaphore = dst_sem;
+    import_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    import_info.handle = handle;
+
+    result = dst_device->pfn_vkImportSemaphoreWin32HandleKHR(dst_device->device, &import_info);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkImportSemaphoreWin32HandleKHR failed with VkResult %d\n", (int)result);
+        dst_device->device.destroySemaphore(dst_sem);
+        CloseHandle(handle);
+        GGML_ABORT("vkImportSemaphoreWin32HandleKHR failed");
+    }
+
+    // Note: For OPAQUE_WIN32, ownership transfers to the imported semaphore, don't close handle
+#else
+    GGML_ASSERT(src_device->pfn_vkGetSemaphoreFdKHR && "vkGetSemaphoreFdKHR not loaded");
+    GGML_ASSERT(dst_device->pfn_vkImportSemaphoreFdKHR && "vkImportSemaphoreFdKHR not loaded");
+
+    // Export fd from source device
+    // Note: SYNC_FD has copy semantics - the fd captures the current signal state.
+    // The semaphore must have a signal operation submitted before export.
+    VkSemaphoreGetFdInfoKHR get_fd_info{};
+    get_fd_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    get_fd_info.semaphore = src_semaphore->s;
+    get_fd_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+
+    int fd = -1;
+    VkResult result = src_device->pfn_vkGetSemaphoreFdKHR(src_device->device, &get_fd_info, &fd);
+    if (result != VK_SUCCESS || fd < 0) {
+        // The case I've mostly seen this happen is when trying to import a semaphore where the source context has not been submitted.
+        GGML_ABORT("vkGetSemaphoreFdKHR failed");
+    }
+
+    // Create semaphore on destination device
+    vk::SemaphoreCreateInfo ci{};
+    vk::Semaphore dst_sem = dst_device->device.createSemaphore(ci);
+
+    // Import the fd
+    VkImportSemaphoreFdInfoKHR import_info{};
+    import_info.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+    import_info.semaphore = dst_sem;
+    import_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    import_info.fd = fd;
+
+    result = dst_device->pfn_vkImportSemaphoreFdKHR(dst_device->device, &import_info);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "vkImportSemaphoreFdKHR failed with VkResult %d\n", (int)result);
+        dst_device->device.destroySemaphore(dst_sem);
+        close(fd);
+        GGML_ABORT("vkImportSemaphoreFdKHR failed");
+    }
+
+    // Note: The fd ownership is transferred to the semaphore on success, don't close it
+#endif
+
+    // Create shared_ptr and add to garbage collector (common to both platforms)
+    vk_semaphore to_return = std::make_shared<vk_semaphore_struct>( dst_sem, src_semaphore->value, false, dst_device );  // Imported semaphores are not re-exportable
+    ctx->gc.semaphores.push_back(to_return);
+    return to_return;
 }
 
 // Record that the given semaphore should be waited on in the next submission of the given context.
@@ -4601,6 +4745,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
             } else if (strcmp("VK_EXT_memory_priority", properties.extensionName) == 0 &&
                        getenv("GGML_VK_ENABLE_MEMORY_PRIORITY")) {
                 device->memory_priority = true;
+#if defined(_WIN32)
+            } else if (strcmp("VK_KHR_external_semaphore_win32", properties.extensionName) == 0) {
+                device->external_semaphore_support = true;
+#else
+            } else if (strcmp("VK_KHR_external_semaphore_fd", properties.extensionName) == 0) {
+                device->external_semaphore_support = true;
+#endif
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
 #if defined(VK_EXT_shader_64bit_indexing)
@@ -4822,6 +4973,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
             last_struct->pNext = (VkBaseOutStructure *)&memory_priority_features;
             last_struct = (VkBaseOutStructure *)&memory_priority_features;
             device_extensions.push_back("VK_EXT_memory_priority");
+        }
+
+        // External semaphore extensions for cross-device synchronization
+        if (device->external_semaphore_support) {
+            device_extensions.push_back("VK_KHR_external_semaphore");
+#if defined(_WIN32)
+            device_extensions.push_back("VK_KHR_external_semaphore_win32");
+#else
+            device_extensions.push_back("VK_KHR_external_semaphore_fd");
+#endif
         }
 
         VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_control_features;
@@ -5163,6 +5324,21 @@ static vk_device ggml_vk_get_device(size_t idx) {
         };
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+
+        // Load external semaphore function pointers if supported
+        if (device->external_semaphore_support) {
+#if defined(_WIN32)
+            device->pfn_vkGetSemaphoreWin32HandleKHR = (PFN_vkGetSemaphoreWin32HandleKHR)
+                vkGetDeviceProcAddr(device->device, "vkGetSemaphoreWin32HandleKHR");
+            device->pfn_vkImportSemaphoreWin32HandleKHR = (PFN_vkImportSemaphoreWin32HandleKHR)
+                vkGetDeviceProcAddr(device->device, "vkImportSemaphoreWin32HandleKHR");
+#else
+            device->pfn_vkGetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)
+                vkGetDeviceProcAddr(device->device, "vkGetSemaphoreFdKHR");
+            device->pfn_vkImportSemaphoreFdKHR = (PFN_vkImportSemaphoreFdKHR)
+                vkGetDeviceProcAddr(device->device, "vkImportSemaphoreFdKHR");
+#endif
+        }
 
         // Queues
         ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
