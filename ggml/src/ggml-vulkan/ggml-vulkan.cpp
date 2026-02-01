@@ -6107,12 +6107,12 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
 }
 
 static vk_subbuffer ggml_vk_tensor_subbuffer(
-    const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
+    vk_device& device, const ggml_tensor * tensor, bool allow_misalign = false) {
 
     vk_buffer buffer = nullptr;
     size_t offset = 0;
-    if (ctx->device->uma) {
-        ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
+    if (device->uma) {
+        ggml_vk_host_get(device, tensor->data, buffer, offset);
     }
     if (!buffer) {
         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
@@ -6123,7 +6123,7 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
 
     size_t size = ggml_nbytes(tensor);
 
-    size_t misalign_bytes = offset & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
+    size_t misalign_bytes = offset & (device->properties.limits.minStorageBufferOffsetAlignment - 1);
     // The shader must support misaligned offsets when indexing into the buffer
     GGML_ASSERT(allow_misalign || misalign_bytes == 0);
     offset &= ~misalign_bytes;
@@ -7437,9 +7437,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         ggml_pipeline_request_descriptor_sets(ctx, dmmv, 1);
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
-    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx->device, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx->device, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx->device, src1);
     vk_subbuffer d_X, d_Y;
 
     if (qx_needs_dequant) {
@@ -7516,7 +7516,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
-        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+        d_F0 = ggml_vk_tensor_subbuffer(ctx->device, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
     }
 
@@ -7525,7 +7525,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         const ggml_tensor * add = cgraph->nodes[node_idx + 2];
         const ggml_tensor * bias = add->src[0] == cgraph->nodes[node_idx + 1] ? add->src[1] : add->src[0];
 
-        d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
+        d_F1 = ggml_vk_tensor_subbuffer(ctx->device, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
@@ -7597,9 +7597,9 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops], true);
-    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, true);
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx->device, cgraph->nodes[node_idx + ctx->num_additional_fused_ops], true);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx->device, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx->device, src1, true);
 
     vk_subbuffer d_F0 = d_D;
 
@@ -7609,7 +7609,7 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
-        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+        d_F0 = ggml_vk_tensor_subbuffer(ctx->device, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
     }
 
@@ -7617,7 +7617,7 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
     if (ctx->num_additional_fused_ops > 1) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 2]->src[1];
 
-        d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
+        d_F1 = ggml_vk_tensor_subbuffer(ctx->device, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
@@ -7696,9 +7696,9 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops], true);
-    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1, true);
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx->device, cgraph->nodes[node_idx + ctx->num_additional_fused_ops], true);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx->device, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx->device, src1, true);
     vk_subbuffer d_F0 = d_D;
 
     uint32_t fusion_flags = 0;
@@ -7707,7 +7707,7 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
         const ggml_tensor * add = cgraph->nodes[node_idx + 1];
         const ggml_tensor * bias = add->src[0] == dst ? add->src[1] : add->src[0];
 
-        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+        d_F0 = ggml_vk_tensor_subbuffer(ctx->device, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS0;
     }
 
@@ -7715,7 +7715,7 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
     if (ctx->num_additional_fused_ops > 1) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 2]->src[1];
 
-        d_F1 = ggml_vk_tensor_subbuffer(ctx, bias);
+        d_F1 = ggml_vk_tensor_subbuffer(ctx->device, bias);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_BIAS1;
     }
 
@@ -8202,10 +8202,10 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         ggml_pipeline_request_descriptor_sets(ctx, dmmv, nei1);
     }
 
-    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
-    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx, src1);
-    vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx, ids);
+    vk_subbuffer d_D = ggml_vk_tensor_subbuffer(ctx->device, cgraph->nodes[node_idx + ctx->num_additional_fused_ops]);
+    vk_subbuffer d_Qx = ggml_vk_tensor_subbuffer(ctx->device, src0);
+    vk_subbuffer d_Qy = ggml_vk_tensor_subbuffer(ctx->device, src1);
+    vk_subbuffer d_ids = ggml_vk_tensor_subbuffer(ctx->device, ids);
     vk_subbuffer d_F0 = d_D;
     vk_subbuffer d_X, d_Y;
 
@@ -8275,7 +8275,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     if (ctx->num_additional_fused_ops > 0) {
         const ggml_tensor * bias = cgraph->nodes[node_idx + 1]->src[1];
 
-        d_F0 = ggml_vk_tensor_subbuffer(ctx, bias);
+        d_F0 = ggml_vk_tensor_subbuffer(ctx->device, bias);
 
         if (cgraph->nodes[node_idx + 1]->op == GGML_OP_MUL) {
             fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE0;
@@ -8289,7 +8289,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     if (ctx->num_additional_fused_ops > 1) {
         const ggml_tensor * scale = cgraph->nodes[node_idx + 2]->src[1];
 
-        d_F1 = ggml_vk_tensor_subbuffer(ctx, scale);
+        d_F1 = ggml_vk_tensor_subbuffer(ctx->device, scale);
         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
     }
 
@@ -8623,12 +8623,12 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
-    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
-    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
-    vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx->device, q);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx->device, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx->device, v);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst);
+    vk_subbuffer mask_buf = mask ? ggml_vk_tensor_subbuffer(ctx->device, mask) : q_buf;
+    vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx->device, sinks) : q_buf;
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | ((mask != nullptr) << 16) | n_head_log2;
 
@@ -9381,11 +9381,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
-    vk_subbuffer src1_buf = use_src1 ? ggml_vk_tensor_subbuffer(ctx, src1, true) : vk_subbuffer{};
-    vk_subbuffer src2_buf = use_src2 ? ggml_vk_tensor_subbuffer(ctx, src2, true) : vk_subbuffer{};
-    vk_subbuffer src3_buf = use_src3 ? ggml_vk_tensor_subbuffer(ctx, src3, true) : vk_subbuffer{};
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx->device, src0, true);
+    vk_subbuffer src1_buf = use_src1 ? ggml_vk_tensor_subbuffer(ctx->device, src1, true) : vk_subbuffer{};
+    vk_subbuffer src2_buf = use_src2 ? ggml_vk_tensor_subbuffer(ctx->device, src2, true) : vk_subbuffer{};
+    vk_subbuffer src3_buf = use_src3 ? ggml_vk_tensor_subbuffer(ctx->device, src3, true) : vk_subbuffer{};
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst, true);
 
     // Compute misalignment offset for descriptors and store it in in push constants.
     init_pushconst_tensor_offsets(ctx, pc, src0, src1, src2, src3, dst);
@@ -9914,10 +9914,10 @@ static void ggml_vk_op_f32_wkv(ggml_backend_vk_context * ctx, vk_context& subctx
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst);
     vk_subbuffer src_buf[7] = {};
     for (int i = 0; i < num_srcs; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx->device, dst->src[i]);
     }
 
     std::array<uint32_t, 3> elements = {
@@ -10013,10 +10013,10 @@ static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, 
         n_head, head_dim, n_group, n_tok
     };
 
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst);
     vk_subbuffer src_buf[7] = {};
     for (int i = 0; i < 7 && dst->src[i] != nullptr; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx->device, dst->src[i]);
     }
 
     std::array<uint32_t, 3> elements;
@@ -10076,11 +10076,11 @@ static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_cont
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x);
-    vk_subbuffer g_buf = ggml_vk_tensor_subbuffer(ctx, g);
-    vk_subbuffer gm_buf = ggml_vk_tensor_subbuffer(ctx, gm);
-    vk_subbuffer gv_buf = ggml_vk_tensor_subbuffer(ctx, gv);
-    vk_subbuffer p_buf = ggml_vk_tensor_subbuffer(ctx, p);
+    vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx->device, x);
+    vk_subbuffer g_buf = ggml_vk_tensor_subbuffer(ctx->device, g);
+    vk_subbuffer gm_buf = ggml_vk_tensor_subbuffer(ctx->device, gm);
+    vk_subbuffer gv_buf = ggml_vk_tensor_subbuffer(ctx->device, gv);
+    vk_subbuffer p_buf = ggml_vk_tensor_subbuffer(ctx->device, p);
 
     std::array<uint32_t, 3> elements = { (uint32_t)ggml_nelements(x), 1, 1 };
 
@@ -10194,7 +10194,7 @@ static void ggml_vk_arange(ggml_backend_vk_context * ctx, vk_context& subctx, gg
     GGML_ASSERT(pipeline != nullptr);
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst, false);
 
     std::array<uint32_t, 3> elements = { (uint32_t)ggml_nelements(dst), 1, 1 };
 
@@ -10216,7 +10216,7 @@ static void ggml_vk_fill(ggml_backend_vk_context * ctx, vk_context& subctx, ggml
     GGML_ASSERT(pipeline != nullptr);
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst, false);
 
     std::array<uint32_t, 3> elements = { (uint32_t)ggml_nelements(dst), 1, 1 };
 
@@ -10608,10 +10608,10 @@ static void ggml_vk_soft_max(ggml_backend_vk_context * ctx, vk_context& subctx, 
         ggml_vk_op_f32<vk_op_soft_max_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_SOFT_MAX, std::move(pc));
     } else {
 
-        vk_subbuffer buf_a = ggml_vk_tensor_subbuffer(ctx, src0);
-        vk_subbuffer buf_b = src1 ? ggml_vk_tensor_subbuffer(ctx, src1) : buf_a;
-        vk_subbuffer buf_c = src2 ? ggml_vk_tensor_subbuffer(ctx, src2) : buf_a;
-        vk_subbuffer buf_d = ggml_vk_tensor_subbuffer(ctx, dst);
+        vk_subbuffer buf_a = ggml_vk_tensor_subbuffer(ctx->device, src0);
+        vk_subbuffer buf_b = src1 ? ggml_vk_tensor_subbuffer(ctx->device, src1) : buf_a;
+        vk_subbuffer buf_c = src2 ? ggml_vk_tensor_subbuffer(ctx->device, src2) : buf_a;
+        vk_subbuffer buf_d = ggml_vk_tensor_subbuffer(ctx->device, dst);
 
         uint32_t elems_per_wg = 128 * 4;
         uint32_t num_wgs = CEIL_DIV(ncols, elems_per_wg);
@@ -10682,10 +10682,10 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    vk_subbuffer logits_buf = ggml_vk_tensor_subbuffer(ctx, logits);
-    vk_subbuffer bias_buf = ggml_vk_tensor_subbuffer(ctx, bias);
-    vk_subbuffer weights_buf = ggml_vk_tensor_subbuffer(ctx, weights);
-    vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, ids);
+    vk_subbuffer logits_buf = ggml_vk_tensor_subbuffer(ctx->device, logits);
+    vk_subbuffer bias_buf = ggml_vk_tensor_subbuffer(ctx->device, bias);
+    vk_subbuffer weights_buf = ggml_vk_tensor_subbuffer(ctx->device, weights);
+    vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx->device, ids);
 
     vk_op_topk_moe_push_constants pc {};
     pc.n_rows = n_rows;
@@ -10787,8 +10787,8 @@ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, c
     vk_pipeline pipeline = use_small ? ctx->device->pipeline_argsort_f32[pipeline_idx]
                                      : ctx->device->pipeline_argsort_large_f32[pipeline_idx];
 
-    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx->device, src0);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst);
     vk_subbuffer subbuf1 = dst_buf;
 
     // Reserve space for ivec2 per element, with rows padded to a power of two
@@ -10935,13 +10935,13 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 
         if (num_elements == ncols) {
             pc2.first_pass = 1;
-            src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+            src_buf = ggml_vk_tensor_subbuffer(ctx->device, src0);
         } else {
             src_buf = { ctx->prealloc_x, dbl_buf_index * dbl_buf_size, dbl_buf_size };
         }
         if (num_dst_elements == k) {
             pc2.last_pass = 1;
-            dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+            dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst);
         } else {
             dst_buf = { ctx->prealloc_x, (dbl_buf_index ^ 1) * dbl_buf_size, dbl_buf_size };
         }
@@ -11008,8 +11008,8 @@ static void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, co
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
 
-    vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
-    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx->device, src0);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx->device, dst);
     vk_subbuffer temp_buf = ggml_vk_subbuffer(ctx->device, ctx->prealloc_split_k, 0);
 
     if (ctx->prealloc_split_k_need_sync) {
