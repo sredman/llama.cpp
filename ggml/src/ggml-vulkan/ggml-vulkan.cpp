@@ -1979,9 +1979,9 @@ typedef void (*ggml_vk_func_t)(ggml_backend_vk_context * ctx, vk_context& subctx
 
 static void ggml_backend_vk_free(ggml_backend_t backend);
 
-static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context * ctx, const vk_buffer &buf, const VkDeviceSize offset) {
+static VkDeviceSize ggml_vk_get_max_buffer_range(const vk_device& device, const vk_buffer &buf, const VkDeviceSize offset) {
     const VkDeviceSize range = std::min(VkDeviceSize{buf->size - offset},
-                                        VkDeviceSize{ctx->device->properties.limits.maxStorageBufferRange});
+                                        VkDeviceSize{device->properties.limits.maxStorageBufferRange});
     return range;
 }
 
@@ -2663,7 +2663,7 @@ static void ggml_vk_destroy_buffer(vk_buffer& buf) {
 }
 
 static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const vk_buffer& buf, size_t offset = 0) {
-    return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
+    return { buf, offset, ggml_vk_get_max_buffer_range(ctx->device, buf, offset) };
 }
 
 static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
