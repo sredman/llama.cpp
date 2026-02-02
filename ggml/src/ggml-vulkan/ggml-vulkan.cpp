@@ -896,6 +896,30 @@ struct vk_subbuffer {
     }
 };
 
+/// @brief A staging buffer for cross-device copies using external host memory.
+/// Each staging buffer owns a page-aligned host memory allocation that can be
+/// imported as a VkBuffer on any device that supports VK_EXT_external_memory_host.
+struct vk_staging_buffer_struct {
+    std::shared_ptr<uint8_t[]> host_memory;         // Page-aligned backing memory
+    size_t size;                                     // Size in bytes
+    bool in_use;                                     // Currently referenced by in-flight command buffers
+    std::map<size_t, vk_buffer> device_buffers;     // device_idx -> VkBuffer wrapper (cached per device)
+
+    vk_staging_buffer_struct() : size(0), in_use(false) {}
+
+    vk_staging_buffer_struct(size_t alloc_size, size_t alignment)
+        : size(alloc_size), in_use(false) {
+        // Allocate page-aligned memory for external memory import
+        void* ptr = aligned_alloc(alignment, alloc_size);
+        host_memory = std::shared_ptr<uint8_t[]>(
+            static_cast<uint8_t*>(ptr),
+            [](uint8_t* p) { free(p); }
+        );
+    }
+};
+
+typedef std::shared_ptr<vk_staging_buffer_struct> vk_staging_buffer;
+
 // vk_event is used for the event-related backend interfaces. It uses 'event' for
 // event_wait and 'fence' for event_synchronize. Polling on an event for
 // event_synchronize wouldn't be sufficient to wait for command buffers to complete,
@@ -1842,6 +1866,10 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // Staging buffer pool for cross-device copies
+    std::vector<vk_staging_buffer> staging_pool;
+    size_t max_staging_size {};  // Largest staging buffer size seen, used for new allocations
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -2602,6 +2630,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     return buf;
 }
+
+static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
 
 static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0)) {
     try {
@@ -6590,6 +6620,250 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         // Copy to dst buffer
         ggml_vk_buffer_write_2d(dst, dst_offset, src->device->sync_staging->ptr, 0, size, 1);
     }
+}
+
+/// @brief Acquire a staging buffer from the pool for cross-device copies.
+/// @param ctx The backend context containing the staging pool.
+/// @param size The minimum size required in bytes.
+/// @param alignment The required alignment for the host memory (from minImportedHostPointerAlignment).
+/// @return Shared pointer to a staging buffer (valid until ggml_vk_graph_cleanup is called).
+static vk_staging_buffer ggml_vk_acquire_staging_buffer(ggml_backend_vk_context * ctx, size_t size, size_t alignment) {
+    // Try to find a free buffer that's large enough
+    for (auto& buf : ctx->staging_pool) {
+        if (!buf->in_use && buf->size >= size) {
+            buf->in_use = true;
+            VK_LOG_DEBUG("ggml_vk_acquire_staging_buffer: reusing buffer of size " << buf->size << " for request of " << size);
+            return buf;
+        }
+    }
+
+    // Allocate a new buffer at the max of requested size and previously seen max
+    const size_t alloc_size = std::max(size, ctx->max_staging_size);
+    ctx->max_staging_size = std::max(ctx->max_staging_size, size);
+
+    VK_LOG_DEBUG("ggml_vk_acquire_staging_buffer: allocating new buffer of size " << alloc_size << " with alignment " << alignment << " (requested: " << size << ", max_seen: " << ctx->max_staging_size << ")");
+
+    vk_staging_buffer new_buf = std::make_shared<vk_staging_buffer_struct>(alloc_size, alignment);
+    new_buf->in_use = true;
+    ctx->staging_pool.push_back(new_buf);
+    return new_buf;
+}
+
+/// @brief Get or create a VkBuffer wrapper for a staging buffer on a specific device.
+/// @param staging The staging buffer.
+/// @param device The device to get/create the buffer for.
+/// @return Reference to the vk_buffer for this device (cached for future calls).
+static vk_buffer& ggml_vk_staging_buffer_for_device(vk_staging_buffer& staging, vk_device& device) {
+    auto it = staging->device_buffers.find(device->idx);
+    if (it != staging->device_buffers.end()) {
+        return it->second;
+    }
+
+    // Create a new VkBuffer wrapper for this device
+    VK_LOG_DEBUG("ggml_vk_staging_buffer_for_device: creating buffer for device " << device->idx << " size " << staging->size);
+    vk_buffer vk_buf = ggml_vk_buffer_from_host_ptr(device, staging->host_memory.get(), staging->size);
+    staging->device_buffers[device->idx] = vk_buf;
+    return staging->device_buffers[device->idx];
+}
+
+/// @brief Release all staging buffers back to the pool.
+/// Called from ggml_vk_graph_cleanup after all GPU work is complete.
+static void ggml_vk_release_staging_buffers(ggml_backend_vk_context * ctx) {
+    for (auto& buf : ctx->staging_pool) {
+        buf->in_use = false;
+    }
+}
+
+static void ggml_vk_test_staging_pool(ggml_backend_vk_context * ctx, vk_device& device) {
+    static bool tested = false;
+    if (tested) { return; }
+    tested = true;
+
+    VK_LOG_DEBUG("ggml_vk_test_staging_pool() - Starting staging pool test");
+
+    const size_t test_size = 4096;
+    const size_t alignment = 4096;
+
+    // Save original pool state
+    const size_t original_pool_size = ctx->staging_pool.size();
+
+    // Test 1: Acquire 3 buffers, verify all different
+    vk_staging_buffer buf1 = ggml_vk_acquire_staging_buffer(ctx, test_size, alignment);
+    VK_LOG_DEBUG("ggml_vk_test_staging_pool: buf1=" << (void*)buf1->host_memory.get());
+    vk_staging_buffer buf2 = ggml_vk_acquire_staging_buffer(ctx, test_size, alignment);
+    vk_staging_buffer buf3 = ggml_vk_acquire_staging_buffer(ctx, test_size, alignment);
+
+    VK_LOG_DEBUG("ggml_vk_test_staging_pool: buf1=" << (void*)buf1->host_memory.get());
+    VK_LOG_DEBUG("ggml_vk_test_staging_pool: buf2=" << (void*)buf2->host_memory.get());
+    VK_LOG_DEBUG("ggml_vk_test_staging_pool: buf3=" << (void*)buf3->host_memory.get());
+
+    GGML_ASSERT(buf1 != buf2 && "Acquired buffers should be different");
+    GGML_ASSERT(buf1->host_memory.get() != buf2->host_memory.get() && "Acquired buffers should be different");
+    GGML_ASSERT(buf2 != buf3 && "Acquired buffers should be different");
+    GGML_ASSERT(buf2->host_memory.get() != buf3->host_memory.get() && "Acquired buffers should be different");
+    GGML_ASSERT(buf1 != buf3 && "Acquired buffers should be different");
+    GGML_ASSERT(buf1->host_memory.get() != buf3->host_memory.get() && "Acquired buffers should be different");
+    GGML_ASSERT(((uintptr_t)buf1->host_memory.get() % alignment) == 0 && "Buffer 1 should be aligned");
+    GGML_ASSERT(((uintptr_t)buf2->host_memory.get() % alignment) == 0 && "Buffer 2 should be aligned");
+    GGML_ASSERT(((uintptr_t)buf3->host_memory.get() % alignment) == 0 && "Buffer 3 should be aligned");
+    GGML_ASSERT(buf1->in_use && buf2->in_use && buf3->in_use && "Acquired buffers should be marked in_use");
+
+    // Test 2: Get device buffer, verify caching works
+    vk_buffer& dev_buf1a = ggml_vk_staging_buffer_for_device(buf1, device);
+    vk_buffer& dev_buf1b = ggml_vk_staging_buffer_for_device(buf1, device);
+    GGML_ASSERT(&dev_buf1a == &dev_buf1b && "Device buffer should be cached");
+
+    // Test 3: Release all, verify in_use is cleared
+    ggml_vk_release_staging_buffers(ctx);
+    GGML_ASSERT(!buf1->in_use && !buf2->in_use && !buf3->in_use && "Released buffers should not be in_use");
+
+    // Test 4: Acquire again, verify reuse
+    vk_staging_buffer buf4 = ggml_vk_acquire_staging_buffer(ctx, test_size, alignment);
+    vk_staging_buffer buf5 = ggml_vk_acquire_staging_buffer(ctx, test_size, alignment);
+
+    // Should reuse existing buffers (pool should not grow)
+    GGML_ASSERT(ctx->staging_pool.size() == original_pool_size + 3 && "Pool should not grow after reuse");
+    GGML_ASSERT(buf4->in_use && buf5->in_use && "Reused buffers should be marked in_use");
+
+    // Cleanup test state
+    ggml_vk_release_staging_buffers(ctx);
+
+    VK_LOG_DEBUG("ggml_vk_test_staging_pool() - Passed staging pool test");
+}
+
+static void ggml_vk_test_buffer_copy_cross_device(ggml_backend_vk_context * ctx, vk_device& src_dev, vk_device& dst_dev);
+static void ggml_vk_test_cross_device_shared_external_memory(ggml_backend_vk_context * ctx, vk_device& src_dev, vk_device& dst_dev);
+
+// Copy data between two devices using a staging buffer from the pool
+static void ggml_vk_buffer_copy_cross_device(ggml_backend_vk_context * ctx, vk_buffer& dst, size_t dst_offset, vk_context& dst_dev_ctx, vk_buffer& src, size_t src_offset, vk_context& src_dev_ctx, size_t size) {
+    VK_LOG_DEBUG("ggml_vk_buffer_copy_cross_device(" << dst->buffer << ", " << dst_offset << ", " << dst_dev_ctx << ", " << src->buffer << ", " << src_offset << ", " << src_dev_ctx << ", " << size << ")");
+
+    GGML_ASSERT(dst->device->external_memory_host && "Device does not support external host memory allocations.");
+    GGML_ASSERT(src->device->external_memory_host && "Device does not support external host memory allocations.");
+
+    #ifdef GGML_VULKAN_RUN_TESTS
+    ggml_vk_test_cross_device_shared_external_memory(ctx, src->device, dst->device);
+    ggml_vk_test_buffer_copy_cross_device(ctx, src->device, dst->device);
+    ggml_vk_test_staging_pool(ctx, src->device);
+    #endif // GGML_VULKAN_RUN_TESTS
+
+    const vk::DeviceSize src_min_alignment = src->device->physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().minImportedHostPointerAlignment;
+    const vk::DeviceSize dst_min_alignment = dst->device->physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().minImportedHostPointerAlignment;
+    const vk::DeviceSize min_alignment = std::max(src_min_alignment, dst_min_alignment);
+
+    // Round up the size to be a multiple of min_alignment
+    const size_t aligned_size = ((size + min_alignment - 1) / min_alignment) * min_alignment;
+
+    // Acquire a staging buffer from the pool
+    vk_staging_buffer staging = ggml_vk_acquire_staging_buffer(ctx, aligned_size, min_alignment);
+
+    // Get VkBuffer wrappers for both devices (cached per device)
+    vk_buffer& src_staging_buf = ggml_vk_staging_buffer_for_device(staging, src->device);
+    vk_buffer& dst_staging_buf = ggml_vk_staging_buffer_for_device(staging, dst->device);
+
+    // Issue copy commands: src -> staging (on src device), staging -> dst (on dst device)
+    ggml_vk_buffer_copy_async(
+        src_dev_ctx,
+        src_staging_buf, 0,
+        src, src_offset,
+        size);
+
+    ggml_vk_buffer_copy_async(
+        dst_dev_ctx,
+        dst, dst_offset,
+        dst_staging_buf, 0,
+        size);
+
+    // Ideally we'd now synchronize the two devices to ensure src -> ext is complete before allowing ext -> dst to start.
+    // However, as of this writing, the only implemented cross-device synchronization is external semaphores, which require
+    // that the source context is submitted before importing the external semaphore.
+    // Thus, unless we take control of the source and submit it, we must expect the caller to insert synchronization.
+    // It should look something like this:
+    // ```
+    // ggml_vk_buffer_copy_cross_device(ctx, dst1, dst_offset1, dst_dev_subctx, src1, src_offset1, src_dev_subctx, size);
+    // ggml_vk_buffer_copy_cross_device(ctx, dst2, dst_offset2, dst_dev_subctx, src2, src_offset2, src_dev_subctx, size);
+    // ...
+    // ggml_vk_buffer_copy_cross_device(ctx, dstN, dst_offsetN, dst_dev_subctx, srcN, src_offsetN, src_dev_subctx, size);
+    // vk_semaphore_create_info semaphore_info{false /*is_timeline*/, true /*exportable*/, 0 /*value*/};
+    // vk_semaphore src_dev_done_semaphore = ggml_vk_create_semaphore(ctx, src_dev, semaphore_info);
+    // ggml_vk_semaphore_signal(src_dev_subctx, src_dev_done_semaphore);
+    // ggml_vk_ctx_end(src_dev_subctx);
+    // ggml_vk_submit(src_dev_subctx, {});
+    // vk_semaphore dst_dev_imported_sempahore = ggml_vk_import_semaphore(ctx, dst_dev, src_dev, src_dev_done_semaphore);
+    // ggml_vk_semaphore_await(dst_dev_subctx, dst_dev_imported_sempahore);
+    // ```
+    // When the caller submits dst_dev_subctx, it will now wait for src_dev to complete.
+}
+
+static void ggml_vk_test_buffer_copy_cross_device(ggml_backend_vk_context * ctx, vk_device& src_dev, vk_device& dst_dev) {
+    static std::vector<std::tuple<vk_device, vk_device>> tested_devices;
+    if (std::find(tested_devices.begin(), tested_devices.end(), std::make_tuple<vk_device&, vk_device&>(src_dev, dst_dev)) == tested_devices.end()) {
+        tested_devices.push_back(std::make_tuple(src_dev, dst_dev));
+    } else{
+        return; // Already tested this device pair, skip
+    }
+    VK_LOG_DEBUG("ggml_vk_test_buffer_copy_cross_device(" << src_dev->name << ", " << dst_dev->name << ") - Cross-device buffer copy test");
+
+    const size_t test_buffer_size = 1024 * 1024; // 1 MB
+    const size_t test_buffer_ne = test_buffer_size / sizeof(float);
+    // Initialize source host memory
+    auto input_deleter = [](float* p) { free(p); };
+    std::unique_ptr<float[], decltype(input_deleter)> input_host_memory(
+        static_cast<float*>(malloc(test_buffer_size)),
+        input_deleter
+    );
+    for (size_t i = 0; i < test_buffer_ne; i++) {
+        input_host_memory[i] = static_cast<float>(i);
+    }
+
+    vk_buffer src = ggml_vk_create_buffer_device(src_dev, test_buffer_size);
+    vk_buffer dst = ggml_vk_create_buffer_device(dst_dev, test_buffer_size);
+
+    // Write data to source buffer
+    ggml_vk_buffer_write(src, 0, input_host_memory.get(), test_buffer_size);
+
+    vk_context src_dev_subctx = ggml_vk_create_temporary_context(src_dev->transfer_queue.cmd_pool);
+    vk_context dst_dev_subctx = ggml_vk_create_temporary_context(dst_dev->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(src_dev, src_dev_subctx);
+    ggml_vk_ctx_begin(dst_dev, dst_dev_subctx);
+
+    // Perform cross-device copy
+    ggml_vk_buffer_copy_cross_device(ctx, dst, 0, dst_dev_subctx, src, 0, src_dev_subctx, test_buffer_size);
+
+    vk_semaphore_create_info semaphore_info{false /*is_timeline*/, true /*exportable*/, 0 /*value*/};
+    vk_semaphore src_dev_done_semaphore = ggml_vk_create_semaphore(ctx, src_dev, semaphore_info);
+    ggml_vk_semaphore_signal(src_dev_subctx, src_dev_done_semaphore);
+    ggml_vk_ctx_end(src_dev_subctx);
+    ggml_vk_submit(src_dev_subctx, {});
+    vk_semaphore dst_dev_imported_sempahore = ggml_vk_import_semaphore(ctx, dst_dev, src_dev, src_dev_done_semaphore);
+    ggml_vk_semaphore_await(dst_dev_subctx, dst_dev_imported_sempahore);
+    ggml_vk_ctx_end(dst_dev_subctx);
+    VK_LOG_DEBUG("ggml_vk_test_buffer_copy_cross_device(): Submitting and waiting for destination device.");
+    vk::Fence fence = dst_dev->device.createFence({});
+    ggml_vk_submit(dst_dev_subctx, fence);
+    VK_CHECK(dst_dev->device.waitForFences(fence, VK_TRUE, UINT64_MAX), "Failed to wait for fence");
+    dst_dev->device.destroyFence(fence);
+
+    // Read back data from destination buffer
+    auto result_deleter = [](float* p) { free(p); };
+    std::unique_ptr<float[], decltype(result_deleter)> result_host_memory(
+        static_cast<float*>(malloc(test_buffer_size)),
+        result_deleter
+    );
+    ggml_vk_buffer_read(dst, 0, result_host_memory.get(), test_buffer_size);
+
+    // Verify results
+    for (size_t i = 0; i < test_buffer_ne; i++) {
+        if (result_host_memory[i] != input_host_memory[i]) {
+            VK_LOG_DEBUG("ggml_vk_test_buffer_copy_cross_device(): Cross-device buffer copy test failed at index " << std::dec << i << ": expected " << input_host_memory[i] << ", got " << result_host_memory[i]);
+            GGML_ABORT("Cross-device buffer copy test failed");
+        }
+    }
+
+    ggml_vk_destroy_buffer(src);
+    ggml_vk_destroy_buffer(dst);
+
+    VK_LOG_DEBUG("ggml_vk_test_buffer_copy_cross_device() - Passed cross-device buffer copy test.");
 }
 
 static void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
@@ -12812,6 +13086,9 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.resetEvent(event);
     }
 
+    // Release all staging buffers back to the pool for reuse
+    ggml_vk_release_staging_buffers(ctx);
+
     ctx->tensor_ctxs.clear();
     ctx->gc.contexts.clear();
     ctx->pipeline_descriptor_set_requirements = 0;
@@ -15066,6 +15343,142 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
     }
 
     return buf;
+}
+
+static void ggml_vk_test_cross_device_shared_external_memory(ggml_backend_vk_context * ctx, vk_device& src_dev, vk_device& dst_dev) {
+    static std::vector<std::tuple<vk_device, vk_device>> tested_devices;
+    if (std::find(tested_devices.begin(), tested_devices.end(), std::make_tuple<vk_device&, vk_device&>(src_dev, dst_dev)) == tested_devices.end()) {
+        tested_devices.push_back(std::make_tuple(src_dev, dst_dev));
+    } else{
+        return; // Already tested this device pair, skip
+    }
+
+    VK_LOG_DEBUG("ggml_vk_test_cross_device_shared_external_memory(" << src_dev->name << ", " << dst_dev->name << ") - Cross-device sharing through external host memory test");
+
+    const vk::DeviceSize src_min_alignment = src_dev->physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().minImportedHostPointerAlignment;
+    const vk::DeviceSize dst_min_alignment = dst_dev->physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>().minImportedHostPointerAlignment;
+    const vk::DeviceSize min_alignment = std::max(src_min_alignment, dst_min_alignment);
+
+    const size_t test_buffer_size = 1024 * 1024; // 1 MB
+    const size_t test_buffer_ne = test_buffer_size / sizeof(float);
+
+    const size_t aligned_size = ((test_buffer_size + min_alignment - 1) / min_alignment) * min_alignment;
+
+    // Initialize host memory, which we will use as input to src_dev;
+    auto input_deleter = [](float* p) { free(p); };
+    std::unique_ptr<float[], decltype(input_deleter)> input_host_memory(
+        static_cast<float*>(aligned_alloc(min_alignment, aligned_size)),
+        input_deleter
+    );
+    for (size_t i = 0; i < test_buffer_ne; i++) {
+        input_host_memory[i] = static_cast<float>(i);
+    }
+
+    // Initialize shared host memory, which we will use as the output from src_dev and the input to dst_dev
+    auto shared_deleter = [](float* p) { free(p); };
+    std::unique_ptr<float[], decltype(shared_deleter)> shared_host_memory(
+        static_cast<float*>(aligned_alloc(min_alignment, aligned_size)),
+        shared_deleter
+    );
+    for (size_t i = 0; i < test_buffer_ne; i++) {
+        shared_host_memory[i] = test_buffer_ne - static_cast<float>(i); // Ensure we know the original contents
+    }
+
+    // Initialize destination host memory, which we will use as the output of dst_dev
+    auto result_deleter = [](float* p) { free(p); };
+    std::unique_ptr<float[], decltype(result_deleter)> result_host_memory(
+        static_cast<float*>(aligned_alloc(min_alignment, aligned_size)),
+        result_deleter
+    );
+    for (size_t i = 0; i < test_buffer_ne; i++) {
+        result_host_memory[i] = 0.0f; // Ensure we know the original contents
+    }
+
+    // Allocate a semaphore on device 0. Device 0 will signal this semaphore at the end of its work,
+    // after which we will import the semaphore to device 1 to wait on it.
+    vk_semaphore_create_info semaphore_info{false /*is_timeline*/, true /*exportable*/, 0 /*value*/};
+    vk_semaphore src_dev_done_semaphore = ggml_vk_create_semaphore(ctx, src_dev, semaphore_info);
+
+    // Allocate external buffers
+    vk_buffer src_input_ext_buffer = ggml_vk_buffer_from_host_ptr(src_dev, input_host_memory.get(), test_buffer_size);
+    vk_buffer src_output_ext_buffer = ggml_vk_buffer_from_host_ptr(src_dev, shared_host_memory.get(), test_buffer_size);
+    vk_buffer dst_input_ext_buffer = ggml_vk_buffer_from_host_ptr(dst_dev, shared_host_memory.get(), test_buffer_size);
+    vk_buffer dst_output_ext_buffer = ggml_vk_buffer_from_host_ptr(dst_dev, result_host_memory.get(), test_buffer_size);
+
+    // Allocate an operation on-device dst buffers
+    vk_buffer src_op_int_buffer = ggml_vk_create_buffer_device(src_dev, test_buffer_size);
+    vk_buffer dst_op_int_buffer = ggml_vk_create_buffer_device(dst_dev, test_buffer_size);
+
+    vk_context src_dev_subctx = ggml_vk_create_temporary_context(src_dev->transfer_queue.cmd_pool);
+    vk_context dst_dev_subctx = ggml_vk_create_temporary_context(dst_dev->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(src_dev, src_dev_subctx);
+    ggml_vk_ctx_begin(dst_dev, dst_dev_subctx);
+
+    // Do "work" on src_dev, consuming the external input buffer values
+    // For simplicity, we use a copy operation here, but this could be any compute operation (SUM, MUL_MAT, etc.).
+    ggml_vk_buffer_copy_async(
+        src_dev_subctx,
+        src_op_int_buffer, 0,
+        src_input_ext_buffer, 0,
+        test_buffer_size);
+
+    // Copy from on-device dst to shared memory
+    // This is really intended to be a copy, as if we had done some compute on the device and now want to share the results.
+    ggml_vk_buffer_copy_async(
+        src_dev_subctx,
+        src_output_ext_buffer, 0,
+        src_op_int_buffer, 0,
+        test_buffer_size);
+
+    // Do "work" on dst_dev, consuming the shared buffer values
+    // For simplicity, we use a copy operation here, but this could be any compute operation (SUM, MUL_MAT, etc.).
+    ggml_vk_buffer_copy_async(
+        dst_dev_subctx,
+        dst_op_int_buffer, 0,
+        dst_input_ext_buffer, 0,
+        test_buffer_size);
+
+    // Copy from on-device dst to shared memory
+    // This is really intended to be a copy, as if we had done some compute on the device and now want to share the results.
+    ggml_vk_buffer_copy_async(
+        dst_dev_subctx,
+        dst_output_ext_buffer, 0,
+        dst_op_int_buffer, 0,
+        test_buffer_size);
+
+    // Submit pipeline for src_dev, signalling the semaphore.
+    ggml_vk_semaphore_signal(src_dev_subctx, src_dev_done_semaphore);
+    ggml_vk_ctx_end(src_dev_subctx);
+    VK_LOG_DEBUG("ggml_vk_test_cross_device_shared_external_memory(): Submitting and waiting for source device.");
+    ggml_vk_submit(src_dev_subctx, {});
+
+    // Import semaphore to dst_dev -- remember this must be done after src_dev submits.
+    vk_semaphore dst_dev_imported_sempahore = ggml_vk_import_semaphore(ctx, dst_dev, src_dev, src_dev_done_semaphore);
+
+    // Submit, awaiting semaphore from src_dev
+    ggml_vk_semaphore_await(dst_dev_subctx, dst_dev_imported_sempahore);
+    ggml_vk_ctx_end(dst_dev_subctx);
+    VK_LOG_DEBUG("ggml_vk_test_cross_device_shared_external_memory(): Submitting and waiting for destination device.");
+    vk::Fence fence = dst_dev->device.createFence({});
+    ggml_vk_submit(dst_dev_subctx, fence);
+    VK_CHECK(dst_dev->device.waitForFences(fence, VK_TRUE, UINT64_MAX), "Failed to wait for fence");
+    dst_dev->device.destroyFence(fence);
+
+    // Verify final results
+    for (size_t i = 0; i < test_buffer_ne; i++) {
+        if (result_host_memory[i] != input_host_memory[i]) {
+            VK_LOG_DEBUG("ggml_vk_test_cross_device_shared_external_memory(): External host memory test failed at index " << std::dec << i << ": expected " << input_host_memory[i] << ", got " << result_host_memory[i]);
+            GGML_ABORT("External host memory test failed");
+        }
+    }
+
+    ggml_vk_destroy_buffer(src_input_ext_buffer);
+    ggml_vk_destroy_buffer(src_output_ext_buffer);
+    ggml_vk_destroy_buffer(dst_input_ext_buffer);
+    ggml_vk_destroy_buffer(dst_output_ext_buffer);
+    ggml_vk_destroy_buffer(src_op_int_buffer);
+    ggml_vk_destroy_buffer(dst_op_int_buffer);
+    VK_LOG_DEBUG("ggml_vk_test_cross_device_shared_external_memory() - Passed cross-device sharing through external host memory test.");
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
