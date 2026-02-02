@@ -12841,11 +12841,24 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
+            #ifdef GGML_VULKAN_ENABLE_LAYER_PARALLELISM
+            // Split buffers have a different context type (ggml_backend_vk_split_buffer_context)
+            // and are used for read-only model weights, so they don't participate in overlap checks
+            if (node->buffer && ggml_backend_buft_is_vk_split(node->buffer->buft)) {
+                return false;
+            }
+            #endif // GGML_VULKAN_ENABLE_LAYER_PARALLELISM
             auto n_base = vk_tensor_offset(node) + node->view_offs;
             auto n_size = ggml_nbytes(node);
             ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
             vk_buffer a_buf = a_buf_ctx->dev_buffer;
             for (auto &other : unsynced_nodes) {
+                #ifdef GGML_VULKAN_ENABLE_LAYER_PARALLELISM
+                // Skip split buffers - they have a different context type
+                if (other->buffer && ggml_backend_buft_is_vk_split(other->buffer->buft)) {
+                    continue;
+                }
+                #endif // GGML_VULKAN_ENABLE_LAYER_PARALLELISM
                 ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
                 vk_buffer o_buf = o_buf_ctx->dev_buffer;
                 if (a_buf == o_buf) {
