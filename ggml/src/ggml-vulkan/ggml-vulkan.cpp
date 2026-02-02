@@ -5332,11 +5332,19 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 vkGetDeviceProcAddr(device->device, "vkGetSemaphoreWin32HandleKHR");
             device->pfn_vkImportSemaphoreWin32HandleKHR = (PFN_vkImportSemaphoreWin32HandleKHR)
                 vkGetDeviceProcAddr(device->device, "vkImportSemaphoreWin32HandleKHR");
+            if (!device->pfn_vkGetSemaphoreWin32HandleKHR || !device->pfn_vkImportSemaphoreWin32HandleKHR) {
+                GGML_LOG_WARN("ggml_vulkan: Failed to load external semaphore functions, disabling support\n");
+                device->external_semaphore_support = false;
+            }
 #else
             device->pfn_vkGetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)
                 vkGetDeviceProcAddr(device->device, "vkGetSemaphoreFdKHR");
             device->pfn_vkImportSemaphoreFdKHR = (PFN_vkImportSemaphoreFdKHR)
                 vkGetDeviceProcAddr(device->device, "vkImportSemaphoreFdKHR");
+            if (!device->pfn_vkGetSemaphoreFdKHR || !device->pfn_vkImportSemaphoreFdKHR) {
+                GGML_LOG_WARN("ggml_vulkan: Failed to load external semaphore functions, disabling support\n");
+                device->external_semaphore_support = false;
+            }
 #endif
         }
 
