@@ -1959,6 +1959,39 @@ struct ggml_backend_vk_context {
     size_t max_staging_size {};  // Largest staging buffer size seen, used for new allocations
 };
 
+// Function pointer type for mul_mat operations on split tensors.
+// Mirrors ggml_cuda_op_mul_mat_t from ggml-cuda.cu.
+// The operation performs matrix multiplication on the given tensor slice.
+//
+// Parameters:
+//   ctx          - Vulkan backend context
+//   device       - The device to run the operation on
+//   subctx       - Command context for recording GPU commands
+//   src0_d       - src0 buffer on this device (weights, possibly split)
+//   src0_offset  - Offset into src0_d where data starts
+//   src1_d       - src1 buffer on this device (activations, copied if needed)
+//   src1_offset  - Offset into src1_d where data starts
+//   dst_d        - Output buffer on this device
+//   dst_offset   - Offset into dst_d where output should be written
+//   row_low      - Start row this device handles (inclusive)
+//   row_high     - End row this device handles (exclusive)
+//   src1_ncols   - Number of src1 columns being processed in this batch
+//   is_main_device - If true, the device is the main device in split row calculation
+typedef void (*ggml_vk_op_mul_mat_t)(
+    ggml_backend_vk_context * ctx,
+    const struct ggml_cgraph * cgraph,
+    int node_idx,
+    vk_device& device,
+    vk_context& subctx,
+    vk_buffer src0_d, size_t src0_offset,
+    vk_buffer src1_d, size_t src1_offset,
+    vk_buffer dst_d, size_t dst_offset,
+    int64_t row_low,
+    int64_t row_high,
+    bool is_main_device,
+    bool disable_split_k
+);
+
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
 
 static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
@@ -8484,6 +8517,427 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
         }, pc, { (uint32_t)ne03, (uint32_t)ne01, (uint32_t)ne12 });
 }
 
+// Multi-device matrix multiplication dispatcher.
+// This function orchestrates matmul across multiple GPUs when src0 is a split tensor.
+// It follows the CUDA pattern from ggml_cuda_op_mul_mat.
+//
+// @param ctx      Backend context
+// @param subctx   Sub-context for the current node (main device compute context)
+// @param cgraph   Computation graph
+// @param node_idx Index of the current node in the computation graph
+// @param src0     Weight tensor (split across devices)
+// @param src1     Activation tensor (on main device)
+// @param dst      Output tensor (on main device)
+// @param op       The actual matmul operation to dispatch on each device
+static void ggml_vk_op_mul_mat(
+    ggml_backend_vk_context * ctx,
+    vk_context& subctx,
+    const ggml_cgraph * cgraph, int node_idx,
+    ggml_vk_op_mul_mat_t op) {
+
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    VK_LOG_DEBUG("ggml_vk_op_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
+    VK_LOG_DEBUG("ggml_vk_op_mul_mat(" << src0->buffer << ", " << src1->buffer << ", " << dst->buffer << ")");
+    VK_LOG_DEBUG("ggml_vk_op_mul_mat(" << src0->name << ", " << src1->name << ", " << dst->name << ")");
+
+    GGML_ASSERT(src0->extra != nullptr);
+
+    ggml_backend_buffer_type_t buft = src0->buffer->buft;
+    ggml_backend_vk_split_buffer_type_context * buft_ctx = (ggml_backend_vk_split_buffer_type_context *)buft->context;
+
+    const int64_t ne00 = src0->ne[0];  // K
+    const int64_t ne01 = src0->ne[1];  // M (split dimension)
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+
+    const int64_t ne10 = src1->ne[0];  // K
+    const int64_t ne11 = src1->ne[1];  // N
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+
+    const int64_t ne0 = dst->ne[0];
+    const int64_t ne1 = dst->ne[1];
+
+    ggml_backend_vk_buffer_context * src1_ctx = (ggml_backend_vk_buffer_context *) src1->buffer->context;
+    ggml_backend_vk_buffer_context * dst_ctx  = (ggml_backend_vk_buffer_context *) dst->buffer->context;
+
+    // Get tensor offsets within their buffers (tensors may not start at offset 0)
+    const uint64_t src1_tensor_offset = vk_tensor_offset(src1) + src1->view_offs;
+    const uint64_t dst_tensor_offset = vk_tensor_offset(dst) + dst->view_offs;
+
+    VK_LOG_DEBUG("ggml_vk_op_mul_mat: dst_tensor_offset=" << dst_tensor_offset
+              << " vk_tensor_offset(dst)=" << vk_tensor_offset(dst)
+              << " dst->view_offs=" << dst->view_offs
+              << " dst->data=" << dst->data
+              << " vk_ptr_base=" << vk_ptr_base);
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || (src1->ne[2] == 1 && src1->ne[3] == 1));
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+
+    GGML_ASSERT(ne00 == ne10);  // K must match
+
+    // Split tensors don't support batching across ne02/ne03
+    GGML_ASSERT(ne02 == 1 && ne03 == 1);
+    GGML_ASSERT(ne12 == 1 && ne13 == 1);
+
+    // Type assertions: src1 and dst must be f32 for our sizeof(float) assumptions
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && "src1 must be f32 for split mul_mat");
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && "dst must be f32 for split mul_mat");
+    GGML_ASSERT(ggml_type_size(GGML_TYPE_F32) == sizeof(float) && "This method assumse F32 is sizeof(float)");
+
+    // Dimension compatibility: dst dimensions must match matmul output
+    // dst = src0 × src1 where src0 is [K, M] and src1 is [K, N] → dst is [M, N]
+    GGML_ASSERT(ne0 == ne01 && "dst ne0 must equal src0 ne01 (M dimension)");
+    GGML_ASSERT(ne1 == ne11 && "dst ne1 must equal src1 ne11 (N dimension)");
+
+    // Stride assertions for contiguous row-major layout
+    GGML_ASSERT(dst->nb[0] == sizeof(float) && "dst must have contiguous elements");
+    GGML_ASSERT(dst->nb[1] == ne0 * sizeof(float) && "dst must have contiguous columns");
+
+    const int64_t i02_divisor = ne12 / ne02;
+    const int64_t i03_divisor = ne13 / ne03;
+
+    const size_t src0_ts = ggml_type_size(src0->type);
+    const size_t src0_bs = ggml_blck_size(src0->type);
+
+    const bool src0_is_contiguous = ggml_is_contiguous(src0);
+    const bool src1_is_contiguous = ggml_is_contiguous(src1);
+
+    const bool is_tensor_split = ggml_backend_buft_is_vk_split(src0->buffer->buft);
+
+    const size_t device_count = (size_t)ggml_backend_vk_get_device_count();
+
+    GGML_ASSERT(!(is_tensor_split && ne02 > 1));
+    GGML_ASSERT(!(is_tensor_split && ne03 > 1));
+    GGML_ASSERT(!(is_tensor_split && ne02 < ne12));
+    GGML_ASSERT(!(is_tensor_split && ne03 < ne13));
+
+    vk_tensor_extra_gpu * tensor_extra = is_tensor_split ? (vk_tensor_extra_gpu *)src0->extra : nullptr;
+    GGML_ASSERT((!is_tensor_split || tensor_extra != nullptr) && "Tensor split requires vk_tensor_extra_gpu properties be assigned.");
+
+    // Step 0: Set up
+    struct dev_data {
+        int64_t  row_low;        // Start row of this device's tensor split responsibility
+        int64_t row_high;        // End row of this device's tensor split responsibility
+        vk_buffer src0_d;        // src0 buffer on this device
+        vk_buffer src1_d;        // src1 buffer on this device (copied if not main)
+        vk_buffer dst_d;         // dst buffer on this device (temp if not main)
+        vk_context compute_ctx;  // Compute context for this device
+        vk_semaphore src1_ready_semaphore = nullptr; // Semaphore signaled when src1_d is ready (either in a CPU staging buffer or worker memory if possible)
+        vk_semaphore dst_ready_semaphore = nullptr;  // Semaphore signaled when this device's dst_d is ready
+    };
+    dev_data dev[GGML_VK_MAX_DEVICES] = {};
+
+    vk_device main_device = ctx->device;
+
+    size_t used_devices = 0;
+
+    for (size_t id = 0; id < device_count; ++id) {
+        vk_get_row_split(&dev[id].row_low, &dev[id].row_high, src0, buft_ctx->tensor_split, id);
+
+        VK_LOG_DEBUG("ggml_vk_op_mul_mat: Beginning to process device " << id << ", "
+                    << "row_low = " << dev[id].row_low << ", "
+                    << "row_high = " << dev[id].row_high);
+    }
+
+    // Step 1: Allocate buffers for each active device (mirrors CUDA L1563-1624)
+    for (size_t id = 0; id < device_count; ++id) {
+        if ((!is_tensor_split && id != ctx->device->idx) || dev[id].row_low == dev[id].row_high) {
+            continue;
+        }
+
+        used_devices++;
+
+        const bool src1_on_device = id == src1_ctx->device.lock()->idx;
+        const bool  dst_on_device = id == dst_ctx->device.lock()->idx;
+        const bool is_main_device = dst_on_device;
+
+        vk_device this_device = tensor_extra->devices[id];
+
+        // src0: Always from split buffer's per-device storage for split tensors
+        if (src0_is_contiguous) {
+            dev[id].src0_d = is_tensor_split ? tensor_extra->device_src0_buffer[id] : nullptr;
+        } else {
+            // TODO: Handle non-contiguous src0 - CUDA copies to temporary buffer with padding
+            GGML_ABORT("Non-contiguous src0 not yet supported in ggml_vk_op_mul_mat");
+        }
+        GGML_ASSERT(dev[id].src0_d != nullptr);
+
+        // src1: Use directly if on device, otherwise allocate temp buffer
+        if (src1_on_device && src1_is_contiguous) {
+            dev[id].src1_d = src1_ctx->dev_buffer;
+        } else {
+            const size_t src1_size = ggml_nbytes(src1);
+            // Grow-only: reallocate if current buffer is too small
+            if (tensor_extra->device_src1_buffer[id] == nullptr || tensor_extra->device_src1_buffer[id]->size < src1_size) {
+                tensor_extra->device_src1_buffer[id] = ggml_vk_create_buffer_device(this_device, src1_size);
+            }
+            dev[id].src1_d = tensor_extra->device_src1_buffer[id];
+        }
+
+        // Note: Unlike CUDA, we don't handle src1 quantization here.
+        // The Vulkan mul_mat functions handle F32→F16 conversion internally if needed.
+
+        // dst: Use directly if on device, otherwise allocate temp buffer for partial results
+        if (dst_on_device) {
+            dev[id].dst_d = dst_ctx->dev_buffer;
+        } else {
+            const size_t size_dst_d = is_tensor_split ? (dev[id].row_high - dev[id].row_low) * ne1 : ggml_nelements(dst);
+            const size_t size_dst_bytes = size_dst_d * sizeof(float);
+            // Grow-only: reallocate if current buffer is too small
+            if (tensor_extra->device_dst_buffer[id] == nullptr || tensor_extra->device_dst_buffer[id]->size < size_dst_bytes) {
+                tensor_extra->device_dst_buffer[id] = ggml_vk_create_buffer_device(this_device, size_dst_bytes);
+            }
+            dev[id].dst_d = tensor_extra->device_dst_buffer[id];
+        }
+
+        if (is_main_device)
+        {
+            dev[id].compute_ctx = subctx;
+        }
+        else
+        {
+            dev[id].compute_ctx = ggml_vk_create_temporary_context(this_device->compute_queue.cmd_pool);
+            ggml_vk_ctx_begin(this_device, dev[id].compute_ctx);
+            dev[id].src1_ready_semaphore = ggml_vk_create_semaphore(ctx, main_device, {false /*is_timeline*/, true /*exportable*/});
+            dev[id].dst_ready_semaphore = ggml_vk_create_semaphore(ctx, this_device, {false /*is_timeline*/, true /*exportable*/});
+        }
+    }
+
+    // Context-swap synchronization approach:
+    // The problem: We can't use vk::Events for backward dependencies (waiting on something
+    // that will be signaled by a command buffer submitted later in the same queue).
+    //
+    // Solution: We split the work into phases with explicit submit boundaries:
+    // Phase 1 (OLD subctx): Record main device mul_mat + src1 copies, submit immediately with semaphore signal
+    // Phase 2: Submit workers (wait on imported src1_ready semaphore, compute, signal dst_ready)
+    // Phase 3 (NEW subctx): Create new context that waits on dst_ready semaphores, swap into subctx ref
+    //
+    // Before ending the original subctx, verify no pending staging operations exist
+    // (these are only used early in setup and should be empty by the time we get here)
+    GGML_ASSERT(subctx->in_memcpys.empty() && "subctx has pending in_memcpys - context swap would lose them");
+    GGML_ASSERT(subctx->out_memcpys.empty() && "subctx has pending out_memcpys - context swap would lose them");
+    GGML_ASSERT(subctx->memsets.empty() && "subctx has pending memsets - context swap would lose them");
+
+    // Main computation loop (mirrors CUDA L1633-1752)
+    // CUDA has triple-nested loop: src1_col_stride → device → batch(ne12*ne13)
+    // For now, we simplify since we assert ne12==ne13==1
+    const int64_t src1_col_stride = (is_tensor_split && used_devices > 1) ? ne11 /* should be MUL_MAT_SRC1_COL_STRIDE */ : ne11;  // TODO: MUL_MAT_SRC1_COL_STRIDE
+    for (int64_t src1_col_0 = 0; src1_col_0 < ne11; src1_col_0 += src1_col_stride) {
+        const int64_t src1_ncols = std::min(src1_col_stride, ne11 - src1_col_0);
+
+        for (size_t id = 0; id < device_count; ++id) {
+            if ((!is_tensor_split && id != ctx->device->idx) || dev[id].row_low == dev[id].row_high) {
+                continue;
+            }
+
+            const bool src1_on_device = id == src1_ctx->device.lock()->idx;
+            const bool  dst_on_device = id == dst_ctx->device.lock()->idx;
+            const bool is_main_device = dst_on_device;
+
+            const int64_t row_diff = dev[id].row_high - dev[id].row_low;
+
+            vk_device this_device = tensor_extra->devices[id];
+
+            VK_LOG_DEBUG("ggml_vk_op_mul_mat: device " << id
+                      << " row_low=" << dev[id].row_low << " row_high=" << dev[id].row_high
+                      << " row_diff=" << row_diff
+                      << " src1_on_device=" << src1_on_device << " (src1_ctx->device.idx=" << src1_ctx->device.lock()->idx << ")"
+                      << " dst_on_device=" << dst_on_device << " (dst_ctx->device.idx=" << dst_ctx->device.lock()->idx << ")"
+                      << " main_device=" << buft_ctx->main_device
+                      << " this_device=" << this_device->name);
+
+            // Inner loop over batch dimensions (ne12 * ne13)
+            // Since we assert ne12==ne13==1, this loop executes once
+            for (int64_t i0 = 0; i0 < ne13 * ne12; ++i0) {
+                const int64_t i03 = i0 / ne12;
+                const int64_t i02 = i0 % ne12;
+
+                // Calculate buffer offsets for this batch slice
+                // For split tensors, src0 data begins at row_low for this device
+                const size_t nbytes_src0_matrix = ne01 * ne00 * src0_ts / src0_bs;
+                const size_t src0_offset = ((i03 / i03_divisor) * ne02 + (i02 / i02_divisor)) * nbytes_src0_matrix;
+
+                // src1 offset within the tensor data (for batching)
+                const size_t src1_batch_offset = (i0 * ne11 + src1_col_0) * ne10 * sizeof(float);
+                // Full offset in the source buffer (tensor base + batch offset)
+                const size_t src1_buf_offset = src1_tensor_offset + src1_batch_offset;
+                // Offset to use when calling op - depends on whether we're using original or temp buffer
+                size_t src1_op_offset = src1_on_device ? src1_buf_offset : 0;
+
+                // dst offset depends on whether dst is on this device
+                // If on device: full stride (ne0) + tensor's base offset, else: partial stride (row_diff)
+                size_t dst_offset = (i0 * ne1 + src1_col_0) * (dst_on_device ? ne0 : row_diff) * sizeof(float);
+                if (dst_on_device) {
+                    // Add tensor's base offset within the buffer
+                    dst_offset += dst_tensor_offset;
+                    // Add row_low offset - this device writes its portion starting at row_low
+                    dst_offset += dev[id].row_low * sizeof(float);
+                }
+
+                // Copy src1 to device if necessary (mirrors CUDA L1680-1706)
+                if (src1_is_contiguous) {
+                    if (!src1_on_device) {
+                        // Need to copy src1 to this device from the device that has it
+                        // The src1 copy is recorded into subctx (main device), which will be
+                        // submitted before workers. Each worker waits on its own src1_ready_semaphore.
+                        vk_device src1_device = src1_ctx->device.lock();
+                        const size_t src1_copy_size = src1_ncols * ne10 * sizeof(float);
+                        GGML_ASSERT(src1_copy_size <= dev[id].src1_d->size && "Scratch buffer for src1 on device is too small for the input.");
+
+                        // Record src1 copy: main device side goes into subctx, worker side into dev[id].compute_ctx
+                        ggml_vk_buffer_copy_cross_device(
+                            ctx,
+                            dev[id].src1_d, 0, dev[id].compute_ctx,
+                            src1_ctx->dev_buffer, src1_buf_offset, subctx,
+                            src1_copy_size);
+                        // Worker will wait on its imported src1_ready_semaphore (signaled in PHASE 1)
+                        ggml_vk_sync_buffers_device(this_device, dev[id].compute_ctx);
+                    }
+                    // src1 is now on device (either already was, or we copied it)
+                } else if (src1_on_device && !src1_is_contiguous) {
+                    // TODO: Copy non-contiguous src1 using ggml_vk_cpy_tensor_2d equivalent
+                    GGML_ABORT("Non-contiguous src1 copy not yet implemented");
+                } else {
+                    GGML_ABORT("fatal error: src1 must be contiguous or on device");
+                }
+
+                // Copy non-contiguous src0 if necessary (mirrors CUDA L1714-1717)
+                if (src1_col_0 == 0 && !src0_is_contiguous && i03 % i03_divisor == 0 && i02 % i02_divisor == 0) {
+                    // TODO: Copy non-contiguous src0
+                    GGML_ABORT("Non-contiguous src0 copy not yet implemented");
+                }
+
+                VK_LOG_DEBUG("ggml_vk_op_mul_mat: op dispatch: device=" << id
+                          << " src0_d=" << dev[id].src0_d.get() << " src0_offset=" << src0_offset
+                          << " src1_d=" << dev[id].src1_d.get() << " src1_op_offset=" << src1_op_offset
+                          << " (src1_buf_offset=" << src1_buf_offset << ")"
+                          << " dst_d=" << dev[id].dst_d.get() << " dst_offset=" << dst_offset
+                          << " row_low=" << dev[id].row_low << " row_high=" << dev[id].row_high);
+
+                // Do the computation (mirrors CUDA L1720-1722)
+                {
+                    vk_context& worker_ctx = dev[id].compute_ctx;
+
+                    op(ctx, cgraph, node_idx,
+                       this_device, worker_ctx,
+                       dev[id].src0_d, src0_offset,
+                       dev[id].src1_d, src1_op_offset,
+                       dev[id].dst_d, dst_offset,
+                       dev[id].row_low, dev[id].row_high,
+                       is_main_device,
+                       false);  // disable_split_k
+
+                    ggml_vk_sync_buffers_device(this_device, dev[id].compute_ctx);
+                }
+
+                VK_LOG_DEBUG("ggml_vk_op_mul_mat: op dispatched for device " << id);
+            }
+        }
+    }
+
+    // === PHASE 1: Submit the original subctx with main device work ===
+    // Create semaphore to synchronize main device work completion with continuation context
+    vk_semaphore main_work_complete = ggml_vk_create_semaphore(ctx, main_device, {false /*is_timeline*/, false /*exportable*/});
+    ggml_vk_semaphore_signal(subctx, main_work_complete);
+
+    // Signal each worker's src1_ready_semaphore individually
+    for (size_t id = 0; id < device_count; ++id) {
+        if (dev[id].src1_ready_semaphore != nullptr) {
+            ggml_vk_semaphore_signal(subctx, dev[id].src1_ready_semaphore);
+        }
+    }
+    VK_LOG_DEBUG("ggml_vk_op_mul_mat: ending and submitting original subctx with main device mul_mat + src1 ready signals");
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, {});
+
+    // === PHASE 2: Create continuation context for dst copy-back ===
+    // This context will wait on workers' dst_ready_semaphores and record dst copies
+    vk_context continuation_ctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+    ggml_vk_ctx_begin(main_device, continuation_ctx);
+
+    // === PHASE 3: Record cross-device dst copies and submit workers ===
+    // For each worker: record dst copy (both sides), signal dst_ready, submit
+    for (size_t id = 0; id < device_count; ++id) {
+        if (dev[id].row_low == dev[id].row_high) {
+            continue;
+        }
+        // Skip main device - it doesn't need to wait on itself
+        if (dev[id].src1_ready_semaphore == nullptr) {
+            continue;
+        }
+
+        vk_device this_device = tensor_extra->devices[id];
+        const bool dst_on_device = id == dst_ctx->device.lock()->idx;
+
+        // Import this worker's src1_ready_semaphore from main device
+        vk_semaphore imported_src1_sem = ggml_vk_import_semaphore(ctx, this_device, main_device, dev[id].src1_ready_semaphore);
+
+        // Worker's compute context waits on this semaphore before starting work
+        ggml_vk_semaphore_await(dev[id].compute_ctx, imported_src1_sem);
+
+        // Record cross-device dst copy if needed
+        // This records into BOTH dev[id].compute_ctx (source side) AND continuation_ctx (dest side)
+        if (!dst_on_device) {
+            const int64_t row_diff = dev[id].row_high - dev[id].row_low;
+            const size_t bytes_per_element = sizeof(float);
+            const size_t col_copy_size = row_diff * bytes_per_element;
+
+            VK_LOG_DEBUG("ggml_vk_op_mul_mat: recording cross-device dst copy for device " << id
+                      << " row_diff=" << row_diff << " col_copy_size=" << col_copy_size);
+
+            // Since we assert ne12==ne13==1, there's only one batch slice
+            for (int64_t col = 0; col < ne11; col++) {
+                const size_t src_col_offset = col * row_diff * bytes_per_element;
+                const size_t dst_col_offset = dst_tensor_offset
+                                            + col * ne0 * bytes_per_element
+                                            + dev[id].row_low * bytes_per_element;
+
+                // Cross-device copy records into both contexts:
+                // - dev[id].compute_ctx: src → staging (worker side)
+                // - continuation_ctx: staging → dst (main side)
+                ggml_vk_buffer_copy_cross_device(
+                    ctx,
+                    dst_ctx->dev_buffer, dst_col_offset, continuation_ctx,  // dst (main buffer)
+                    dev[id].dst_d, src_col_offset, dev[id].compute_ctx,     // src (partial result)
+                    col_copy_size);
+            }
+        }
+
+        ggml_vk_sync_buffers_device(main_device, continuation_ctx);
+
+        // Signal dst_ready when worker's compute + src-side copies are done
+        ggml_vk_semaphore_signal(dev[id].compute_ctx, dev[id].dst_ready_semaphore);
+
+        VK_LOG_DEBUG("ggml_vk_op_mul_mat: submitting worker device " << id);
+        ggml_vk_ctx_end(dev[id].compute_ctx);
+        ggml_vk_submit(dev[id].compute_ctx, {});
+
+        // Import the worker's dst_ready_semaphore into main device
+        vk_semaphore imported_dst_sem = ggml_vk_import_semaphore(ctx, main_device, this_device, dev[id].dst_ready_semaphore);
+
+        // Continuation context waits on this worker's dst_ready before executing the dst-side copies
+        ggml_vk_semaphore_await(continuation_ctx, imported_dst_sem);
+        VK_LOG_DEBUG("ggml_vk_op_mul_mat: continuation_ctx will wait on dst_ready_semaphore from device " << id);
+    }
+
+    // Wait for main device's original work to complete before continuation can proceed
+    // This ensures the main device's mul_mat result is written before any subsequent ops read it
+    ggml_vk_semaphore_await(continuation_ctx, main_work_complete);
+
+    // === PHASE 4: Swap continuation context into subctx reference ===
+    // This makes the caller's subctx reference point to our new context.
+    // Subsequent operations in the same graph will be recorded into continuation_ctx.
+    subctx.swap(continuation_ctx);
+    ctx->compute_ctx = subctx;
+    VK_LOG_DEBUG("ggml_vk_op_mul_mat: swapped continuation_ctx into subctx, updated ctx->compute_ctx");
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -13496,7 +13950,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         return false;
     }
 
-    ctx->tensor_ctxs[node_idx] = compute_ctx;
+    ctx->tensor_ctxs[node_idx_begin] = compute_ctx;
 
 #if defined(GGML_VULKAN_CHECK_RESULTS)
     // Force context reset on each node so that each tensor ends up in its own context
