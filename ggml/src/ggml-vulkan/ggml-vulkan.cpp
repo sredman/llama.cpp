@@ -14167,6 +14167,18 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         const ggml_tensor *mul = cgraph->nodes[node_idx];
         const ggml_tensor *add = cgraph->nodes[node_idx + 1];
 
+#ifdef GGML_VULKAN_ENABLE_LAYER_PARALLELISM
+        const ggml_tensor *src0 = mul->src[0];
+        if (src0->buffer && ggml_backend_buft_is_vk_split(src0->buffer->buft)) {
+            // Split tensors don't support MUL_MAT+ADD fusion yet
+            // This would require splitting and copying the add data into the worker devices
+            // which could save time overall if the worker devices support async data copy,
+            // such that the data could be transferred while the mul_mat computation is running,
+            // but would otherwise likely be a net negative.
+            return false;
+        }
+#endif
+
         if (!mm_add_ok(mul, add)) {
             return false;
         }
