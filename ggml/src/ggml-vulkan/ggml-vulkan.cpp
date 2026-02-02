@@ -870,6 +870,25 @@ struct vk_device_struct {
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
 
+    // Per-device scratch buffers for split matmul operations.
+    // These mirror ctx->prealloc_* but are per-device for multi-GPU dispatch.
+    size_t prealloc_size_x = 0;      // Size of prealloc_x buffer
+    size_t prealloc_size_y = 0;      // Size of prealloc_y buffer
+    size_t prealloc_size_split_k = 0; // Size of prealloc_split_k buffer
+    vk_buffer prealloc_x;             // Scratch buffer for dequantized src0
+    vk_buffer prealloc_y;             // Scratch buffer for dequantized/quantized src1
+    vk_buffer prealloc_split_k;       // Scratch buffer for split_k reduction
+    bool prealloc_x_need_sync = false;
+    bool prealloc_y_need_sync = false;
+    bool prealloc_split_k_need_sync = false;
+    const ggml_tensor * prealloc_y_last_tensor_used = nullptr;
+    vk_pipeline_struct * prealloc_y_last_pipeline_used = nullptr;
+
+    std::vector<vk::DescriptorPool> descriptor_pools;
+    std::vector<vk::DescriptorSet> descriptor_sets;
+    uint32_t descriptor_set_idx {};
+    uint32_t pipeline_descriptor_set_requirements {};
+
     std::unique_ptr<vk_memory_logger> memory_logger;
 
     ~vk_device_struct() {
@@ -878,6 +897,12 @@ struct vk_device_struct {
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
+
+        if (descriptor_pools.size() > 0) {
+            for (auto& descriptor_pool : descriptor_pools) {
+                device.destroyDescriptorPool(descriptor_pool);
+            }
+        }
 
         compute_queue.cmd_pool.destroy(device);
         transfer_queue.cmd_pool.destroy(device);
@@ -1651,8 +1676,10 @@ struct ggml_vk_garbage_collector {
 };
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
+static void ggml_vk_preallocate_buffers_device(vk_device& device);
 static void ggml_vk_load_shaders(vk_device& device);
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
+static void ggml_pipeline_allocate_descriptor_sets_device(vk_device& device);
 
 static bool vk_memory_logger_enabled = false;
 
@@ -2256,6 +2283,16 @@ static void ggml_pipeline_request_descriptor_sets(ggml_backend_vk_context *ctx, 
     ggml_pipeline_allocate_descriptor_sets(ctx);
 }
 
+static void ggml_pipeline_request_descriptor_sets_device(vk_device& device, vk_pipeline& pipeline, uint32_t n) {
+    VK_LOG_DEBUG("ggml_pipeline_request_descriptor_sets(" << pipeline->name << ", " << n << ")");
+    device->pipeline_descriptor_set_requirements += n;
+    if (!pipeline->compiled) {
+        pipeline->needed = true;
+        ggml_vk_load_shaders(device);
+    }
+    ggml_pipeline_allocate_descriptor_sets_device(device);
+}
+
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx) {
 
     if (ctx->descriptor_sets.size() >= ctx->pipeline_descriptor_set_requirements) {
@@ -2289,6 +2326,42 @@ static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx
         vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(ctx->descriptor_pools[pool_idx], alloc_count, layouts.data());
         std::vector<vk::DescriptorSet> sets = device->device.allocateDescriptorSets(descriptor_set_alloc_info);
         ctx->descriptor_sets.insert(ctx->descriptor_sets.end(), sets.begin(), sets.end());
+
+        pool_idx++;
+    }
+}
+
+static void ggml_pipeline_allocate_descriptor_sets_device(vk_device& device) {
+
+    if (device->descriptor_sets.size() >= device->pipeline_descriptor_set_requirements) {
+        // Enough descriptors are available
+        return;
+    }
+
+    // Grow by 50% to avoid frequent allocations
+    uint32_t needed = std::max(3 * device->descriptor_sets.size() / 2, size_t{device->pipeline_descriptor_set_requirements});
+    uint32_t to_alloc = needed - device->descriptor_sets.size();
+    uint32_t pool_remaining = VK_DEVICE_DESCRIPTOR_POOL_SIZE - device->descriptor_sets.size() % VK_DEVICE_DESCRIPTOR_POOL_SIZE;
+    uint32_t pool_idx = device->descriptor_sets.size() / VK_DEVICE_DESCRIPTOR_POOL_SIZE;
+
+    while (to_alloc > 0) {
+        const uint32_t alloc_count = std::min(pool_remaining, to_alloc);
+        to_alloc -= alloc_count;
+        pool_remaining = VK_DEVICE_DESCRIPTOR_POOL_SIZE;
+
+        if (pool_idx >= device->descriptor_pools.size()) {
+            vk::DescriptorPoolSize descriptor_pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
+            vk::DescriptorPoolCreateInfo descriptor_pool_create_info({}, VK_DEVICE_DESCRIPTOR_POOL_SIZE, descriptor_pool_size);
+            device->descriptor_pools.push_back(device->device.createDescriptorPool(descriptor_pool_create_info));
+        }
+
+        std::vector<vk::DescriptorSetLayout> layouts(alloc_count);
+        for (uint32_t i = 0; i < alloc_count; i++) {
+            layouts[i] = device->dsl;
+        }
+        vk::DescriptorSetAllocateInfo descriptor_set_alloc_info(device->descriptor_pools[pool_idx], alloc_count, layouts.data());
+        std::vector<vk::DescriptorSet> sets = device->device.allocateDescriptorSets(descriptor_set_alloc_info);
+        device->descriptor_sets.insert(device->descriptor_sets.end(), sets.begin(), sets.end());
 
         pool_idx++;
     }
@@ -12775,6 +12848,35 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
+    }
+}
+
+static void ggml_vk_preallocate_buffers_device(vk_device& device) {
+    VK_LOG_DEBUG("ggml_vk_preallocate_buffers_device(" << device->name << ")");
+
+    if (device->prealloc_x == nullptr || (device->prealloc_size_x > 0 && device->prealloc_x->size < device->prealloc_size_x)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers_device(x_size: " << device->prealloc_size_x << ")");
+        // Resize buffer
+        if (device->prealloc_x != nullptr) {
+            ggml_vk_destroy_buffer(device->prealloc_x);
+        }
+        device->prealloc_x = ggml_vk_create_buffer_device(device, device->prealloc_size_x);
+    }
+    if (device->prealloc_y == nullptr || (device->prealloc_size_y > 0 && device->prealloc_y->size < device->prealloc_size_y)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers_device(y_size: " << device->prealloc_size_y << ")");
+        // Resize buffer
+        if (device->prealloc_y != nullptr) {
+            ggml_vk_destroy_buffer(device->prealloc_y);
+        }
+        device->prealloc_y = ggml_vk_create_buffer_device(device, device->prealloc_size_y);
+    }
+    if (device->prealloc_split_k == nullptr || (device->prealloc_size_split_k > 0 && device->prealloc_split_k->size < device->prealloc_size_split_k)) {
+        VK_LOG_MEMORY("ggml_vk_preallocate_buffers_device(split_k_size: " << device->prealloc_size_split_k << ")");
+        // Resize buffer
+        if (device->prealloc_split_k != nullptr) {
+            ggml_vk_destroy_buffer(device->prealloc_split_k);
+        }
+        device->prealloc_split_k = ggml_vk_create_buffer_device(device, device->prealloc_size_split_k);
     }
 }
 
