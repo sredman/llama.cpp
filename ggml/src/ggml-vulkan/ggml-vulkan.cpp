@@ -15341,6 +15341,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         return false;
     }
 
+#ifdef GGML_VULKAN_ENABLE_LAYER_PARALLELISM
+    // Split buffers are only supported for matrix multiplication operations.
+    // For other operations, tensors must use regular device buffers.
+    if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const ggml_tensor * src = op->src[i];
+            if (src != nullptr && src->buffer != nullptr && ggml_backend_buft_is_vk_split(src->buffer->buft)) {
+                return false;
+            }
+        }
+    }
+#endif
+
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -15432,6 +15445,27 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     a = op->src[2];
                     b = op->src[1];
                 }
+
+#ifdef GGML_VULKAN_ENABLE_LAYER_PARALLELISM
+                // Check if source tensor is in a split buffer
+                if (a->buffer && ggml_backend_buft_is_vk_split(a->buffer->buft)) {
+                    // Split buffers only support 2D matrices (no batching)
+                    if (a->ne[2] > 1 || a->ne[3] > 1) {
+                        return false;
+                    }
+                    // For small weight matrices the active device can end up without any rows,
+                    // don't use row split in those cases - this avoids edge cases and performance
+                    // would not be good anyway
+                    ggml_backend_vk_split_buffer_type_context * buft_ctx =
+                        (ggml_backend_vk_split_buffer_type_context *)a->buffer->buft->context;
+                    int64_t row_low, row_high;
+                    vk_get_row_split(&row_low, &row_high, a, buft_ctx->tensor_split, ctx->device);
+                    if (row_low == row_high) {
+                        return false;
+                    }
+                }
+#endif
+
                 if (a->ne[3] != b->ne[3]) {
                     return false;
                 }
