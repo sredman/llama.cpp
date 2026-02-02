@@ -6588,9 +6588,11 @@ static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_
 }
 
 static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
-    VK_LOG_DEBUG("ggml_vk_buffer_copy_async(" << size << ")");
+    VK_LOG_DEBUG("ggml_vk_buffer_copy_async(" << ctx << ", " << dst << ", " << dst_offset << ", " << src << ", " << src_offset << ", " << size << ")");
     // Make sure both buffers are on same device
     GGML_ASSERT(src->device == dst->device);
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(src != nullptr);
 
     VkBufferCopy bc{ src_offset, dst_offset, size };
 
