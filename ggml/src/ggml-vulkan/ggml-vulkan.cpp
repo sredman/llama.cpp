@@ -9007,6 +9007,25 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
 
+    const bool use_mul_mat_vec_p021_f16_f32 =
+        src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
+        // detect 0213 permutation, and batch size of 1
+        src0->nb[0] <= src0->nb[2] &&
+        src0->nb[2] <= src0->nb[1] &&
+        src0->nb[1] <= src0->nb[3] &&
+        src1->nb[0] <= src1->nb[2] &&
+        src1->nb[2] <= src1->nb[1] &&
+        src1->nb[1] <= src1->nb[3] &&
+        src0->ne[3] == 1 &&
+        src1->ne[3] == 1;
+    const bool use_mul_mat_vec_nc_f16_f32 =
+        src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
+               !ggml_is_permuted(src0) && !ggml_is_permuted(src1);
+    const bool use_mul_mat_vec_q_f16 =
+                (dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
+                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type));
+    const bool use_mul_mat_q_f16 = true; // Default case
+
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
     // Split_k doesn't work with M splitting.
@@ -9034,24 +9053,13 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
 
             m_offset += cur_M_size;
         }
-    } else if (src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
-        // detect 0213 permutation, and batch size of 1
-        src0->nb[0] <= src0->nb[2] &&
-        src0->nb[2] <= src0->nb[1] &&
-        src0->nb[1] <= src0->nb[3] &&
-        src1->nb[0] <= src1->nb[2] &&
-        src1->nb[2] <= src1->nb[1] &&
-        src1->nb[1] <= src1->nb[3] &&
-        src0->ne[3] == 1 &&
-        src1->ne[3] == 1) {
+    } else if (use_mul_mat_vec_p021_f16_f32) {
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
-    } else if (src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && dst->ne[1] == 1 &&
-               !ggml_is_permuted(src0) && !ggml_is_permuted(src1)) {
+    } else if (use_mul_mat_vec_nc_f16_f32) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
-    } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
-               (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+    } else if (use_mul_mat_vec_q_f16) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
