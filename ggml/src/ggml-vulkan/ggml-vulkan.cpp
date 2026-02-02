@@ -2967,6 +2967,27 @@ static vk_subbuffer ggml_vk_subbuffer(vk_device& device, const vk_buffer& buf, s
     return { buf, offset, ggml_vk_get_max_buffer_range(device, buf, offset) };
 }
 
+// Device version of ggml_vk_sync_buffers that resets per-device prealloc sync flags
+static void ggml_vk_sync_buffers_device(vk_device& device, vk_context& subctx) {
+    VK_LOG_DEBUG("ggml_vk_sync_buffers_device(" << device->name << ")");
+
+    const bool transfer_queue = subctx->p->q->transfer_only;
+
+    device->prealloc_x_need_sync = device->prealloc_y_need_sync = device->prealloc_split_k_need_sync = false;
+
+    subctx->s->buffer.pipelineBarrier(
+        subctx->p->q->stage_flags,
+        subctx->p->q->stage_flags,
+        {},
+        { {
+          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
+          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
+        } },
+        {},
+        {}
+    );
+}
+
 static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
 
@@ -6541,6 +6562,40 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     subctx->s->buffer.dispatch(wg0, wg1, wg2);
 }
 
+// Per-device version of ggml_vk_dispatch_pipeline
+// TODO: Consolidate with ggml_vk_dispatch_pipeline -- Tricky because we need to access the split descriptor set in this
+// method and the single context's descriptor set in ggml_vk_dispatch_pipeline
+template <typename T>
+static void ggml_vk_dispatch_pipeline_device(vk_device& device, vk_context& subctx, vk_pipeline& pipeline,
+                                              std::initializer_list<vk::DescriptorBufferInfo> const& descriptor_buffer_infos,
+                                              const T &push_constants, std::array<uint32_t, 3> elements) {
+    const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
+    const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
+    const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
+    VK_LOG_DEBUG("ggml_vk_dispatch_pipeline_device(" << device->name << ", " << pipeline->name << ", {";
+    for (auto& buffer : descriptor_buffer_infos) {
+        std::cerr << "(" << buffer.buffer << ", " << buffer.offset << ", " << buffer.range << "), ";
+    }
+    std::cerr << "}, (" << wg0 << "," << wg1 << "," << wg2 << "))");
+
+    GGML_ASSERT(device->descriptor_set_idx < device->descriptor_sets.size());
+    GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
+    GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
+
+    vk::DescriptorSet& descriptor_set = device->descriptor_sets[device->descriptor_set_idx++];
+    vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
+    device->device.updateDescriptorSets({ write_descriptor_set }, {});
+
+    subctx->s->buffer.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+    subctx->s->buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    subctx->s->buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                pipeline->layout,
+                                0,
+                                { descriptor_set },
+                                {});
+    subctx->s->buffer.dispatch(wg0, wg1, wg2);
+}
+
 static void ggml_vk_end_submission(vk_submission& s, std::vector<vk_semaphore> wait_semaphores, std::vector<vk_semaphore> signal_semaphores) {
     s.buffer.end();
 
@@ -7332,6 +7387,39 @@ static uint32_t ggml_vk_guess_matmul_pipeline_align(vk_device& device, vk_matmul
     return ggml_vk_guess_matmul_pipeline(device, mmp, m, n, true, src0_type, src1_type)->align;
 }
 
+static void ggml_vk_matmul_device(
+        vk_device& device, vk_context& subctx, vk_pipeline& pipeline,
+        vk_subbuffer&& a, vk_subbuffer&& b, vk_subbuffer&& d, vk_subbuffer&& split_k_buffer,
+        uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
+        uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
+        uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
+        uint32_t padded_n) {
+        VK_LOG_DEBUG("ggml_vk_matmul_device(" << device->name << ", a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
+    if (split_k == 1) {
+        const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, k, ne02, ne12, broadcast2, broadcast3, padded_n };
+        ggml_vk_dispatch_pipeline_device(device, subctx, pipeline, { a, b, d }, pc, { m, n, batch });
+        return;
+    }
+
+    if (device->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers_device(device, subctx);
+    }
+
+    GGML_ASSERT(batch_stride_d == m * n);
+
+    // Round the split size up to a multiple of 256 (k-quant alignment)
+    uint32_t k_split = CEIL_DIV(k, split_k);
+    k_split = ROUNDUP_POW2(k_split, 256);
+
+    const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, k_split, ne02, ne12, broadcast2, broadcast3, padded_n };
+    // Make sure enough workgroups get assigned for split k to work
+    ggml_vk_dispatch_pipeline_device(device, subctx, pipeline, { a, b, split_k_buffer }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, batch });
+    ggml_vk_sync_buffers_device(device, subctx);
+    const std::array<uint32_t, 2> pc2 = { (uint32_t)(m * n * batch), split_k };
+    ggml_vk_dispatch_pipeline_device(device, subctx, device->pipeline_matmul_split_k_reduce, { split_k_buffer, d }, pc2, { m * n * batch, 1, 1 });
+    device->prealloc_split_k_need_sync = true;
+}
+
 static void ggml_vk_matmul(
         ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
         vk_subbuffer&& a, vk_subbuffer&& b, vk_subbuffer&& d, vk_subbuffer&& split_k_buffer,
@@ -7537,6 +7625,35 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(vk_device& device, const ggml_tensor
     GGML_ABORT("fatal error");
 }
 
+static void ggml_vk_cpy_to_contiguous_device(vk_device& device, vk_context& subctx, vk_pipeline pipeline, const ggml_tensor * tensor, const vk_subbuffer & in, const vk_subbuffer & out) {
+    VK_LOG_DEBUG("ggml_vk_cpy_to_contiguous_device((" << tensor << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << "), ";
+    std::cerr << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ")");
+    const int tensor_type_size = ggml_type_size(tensor->type);
+
+    const uint32_t ne = ggml_nelements(tensor);
+    std::array<uint32_t, 3> elements;
+
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
+
+    vk_op_unary_push_constants pc = {
+        (uint32_t)ne,
+        (uint32_t)tensor->ne[0], (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[2], (uint32_t)tensor->ne[3], (uint32_t)tensor->nb[0] / tensor_type_size, (uint32_t)tensor->nb[1] / tensor_type_size, (uint32_t)tensor->nb[2] / tensor_type_size, (uint32_t)tensor->nb[3] / tensor_type_size,
+        (uint32_t)tensor->ne[0], (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[2], (uint32_t)tensor->ne[3],                       1                   , (uint32_t)tensor->ne[0]                   , (uint32_t)(tensor->ne[0] * tensor->ne[1]) , (uint32_t)(tensor->ne[0] * tensor->ne[1] * tensor->ne[2]),
+        0,
+        0.0f, 0.0f,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    };
+    init_pushconst_fastdiv(pc);
+    ggml_vk_dispatch_pipeline_device(device, subctx, pipeline, { in, out }, pc, elements);
+    ggml_vk_sync_buffers_device(device, subctx);
+}
+
 static void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline pipeline, const ggml_tensor * tensor, const vk_subbuffer & in, const vk_subbuffer & out) {
     VK_LOG_DEBUG("ggml_vk_cpy_to_contiguous((" << tensor << ", type=" << tensor->type << ", ne0=" << tensor->ne[0] << ", ne1=" << tensor->ne[1] << ", ne2=" << tensor->ne[2] << ", ne3=" << tensor->ne[3] << ", nb0=" << tensor->nb[0] << ", nb1=" << tensor->nb[1] << ", nb2=" << tensor->nb[2] << ", nb3=" << tensor->nb[3] << "), ";
     std::cerr << "buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ")");
@@ -7574,6 +7691,15 @@ static vk_pipeline ggml_vk_get_quantize_pipeline(vk_device& device, ggml_type ty
             std::cerr << "Missing quantize pipeline for type: " << ggml_type_name(type) << std::endl;
             GGML_ABORT("fatal error");
     }
+}
+
+static void ggml_vk_quantize_q8_1_device(vk_device& device, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
+    VK_LOG_DEBUG("ggml_vk_quantize_q8_1_device(" << device->name << ", buffer in size=" << in.buffer->size << ", buffer out size=" << out.buffer->size << ", " << ne << ")");
+
+    vk_pipeline pipeline = ggml_vk_get_quantize_pipeline(device, GGML_TYPE_Q8_1);
+
+    ggml_vk_dispatch_pipeline_device(device, subctx, pipeline, { in, out }, std::array<uint32_t, 1>{ne}, { ne, 1, 1 });
+    ggml_vk_sync_buffers_device(device, subctx);
 }
 
 static void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& subctx, const vk_subbuffer & in, const vk_subbuffer & out, uint32_t ne) {
