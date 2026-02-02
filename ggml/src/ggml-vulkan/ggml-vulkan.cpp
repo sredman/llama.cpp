@@ -16469,6 +16469,30 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                     ggml_vk_buffer_read(buffer_gpu, offset, srci_clone->data, srci_size);
                     memcpy(srci_clone->nb, srci->nb, sizeof(size_t) * GGML_MAX_DIMS);
                 }
+            } else if (ggml_backend_buft_is_vk_split(srci->buffer->buft)) {
+                // Split buffer: read from each device's buffer portion
+                ggml_backend_vk_split_buffer_type_context * buft_ctx = (ggml_backend_vk_split_buffer_type_context *)srci->buffer->buft->context;
+                vk_tensor_extra_gpu * extra = (vk_tensor_extra_gpu *)srci->extra;
+                GGML_ASSERT(extra != nullptr);
+
+                const size_t nb1 = srci->nb[1];
+
+                for (int id = 0; id < ggml_backend_vk_get_device_count(); ++id) {
+                    int64_t row_low, row_high;
+                    vk_get_row_split(&row_low, &row_high, srci, buft_ctx->tensor_split, id);
+
+                    int64_t nrows_split = row_high - row_low;
+                    if (nrows_split == 0) {
+                        continue;
+                    }
+
+                    const size_t offset_split = row_low * nb1;
+                    const size_t size_split = ggml_nbytes_split(srci, nrows_split);
+
+                    vk_buffer buf = extra->device_src0_buffer[id];
+                    ggml_vk_buffer_read(buf, 0, (char *)srci_clone->data + offset_split, size_split);
+                }
+                memcpy(srci_clone->nb, srci->nb, sizeof(size_t) * GGML_MAX_DIMS);
             } else {
                 GGML_ABORT("fatal error");
             }
@@ -16858,6 +16882,8 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
         }
 
         ggml_vk_buffer_read(buffer_gpu, offset, tensor_data, tensor_size);
+    } else {
+        GGML_ASSERT(false && "Buffer type not suported");
     }
 
     float first_error_result = -1.0f;
@@ -17003,7 +17029,7 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
     comp_result = nullptr;
     comp_size = 0;
 
-    if (ggml_backend_buffer_is_vk(tensor->buffer)) {
+    if (ggml_backend_buffer_is_vk(tensor->buffer) || ggml_backend_buft_is_vk_split(tensor->buffer->buft)) {
         free(tensor_data);
     }
 
