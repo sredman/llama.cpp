@@ -9007,6 +9007,13 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
 
+#ifdef GGML_VULKAN_ENABLE_LAYER_PARALLELISM
+    // Check if src0 is a split tensor (distributed across multiple devices)
+    const bool is_split_tensor = src0->buffer && ggml_backend_buft_is_vk_split(src0->buffer->buft);
+#else
+    const bool is_split_tensor = false;
+#endif
+
     const bool use_mul_mat_vec_p021_f16_f32 =
         src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && dst->ne[1] == 1 &&
         // detect 0213 permutation, and batch size of 1
@@ -9031,8 +9038,8 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     // Split_k doesn't work with M splitting.
     // This only supports batchsize == 1.
     const size_t nbytes = ggml_nbytes(src0);
-    const bool needs_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
-    if (needs_split) {
+    const bool needs_m_split = dst->ne[2] == 1 && dst->ne[3] == 1 && nbytes > ctx->device->properties.limits.maxStorageBufferRange;
+    if (needs_m_split) {
         // Choose the number of rows that can fit (and divide by two, to allow for any additional offsets)
         const uint32_t M_split = ctx->device->properties.limits.maxStorageBufferRange / (2 * src0->nb[1]);
         uint32_t m_offset = 0;
@@ -9053,16 +9060,26 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
 
             m_offset += cur_M_size;
         }
-    } else if (use_mul_mat_vec_p021_f16_f32) {
+    } else if (!is_split_tensor && use_mul_mat_vec_p021_f16_f32) {
         ggml_vk_mul_mat_vec_p021_f16_f32(ctx, subctx, cgraph, node_idx);
-    } else if (use_mul_mat_vec_nc_f16_f32) {
+    } else if (!is_split_tensor && use_mul_mat_vec_nc_f16_f32) {
         ggml_vk_mul_mat_vec_nc_f16_f32(ctx, subctx, cgraph, node_idx);
     // mul_mat_vec supports batching ne12*ne13 when ne11==1, or treating ne11 as the batch size (up to four)
     // when ne12 and ne13 are one.
-    } else if (use_mul_mat_vec_q_f16) {
+    } else if (!is_split_tensor && use_mul_mat_vec_q_f16) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+    } else if (!is_split_tensor) {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, cgraph, node_idx, false);
+    } else if (is_split_tensor && use_mul_mat_vec_p021_f16_f32) {
+        GGML_ASSERT(false && "is_split_tensor && use_mul_mat_vec_p021_f16_f32 path not implemented");
+    } else if (is_split_tensor && use_mul_mat_vec_nc_f16_f32) {
+        GGML_ASSERT(false && "is_split_tensor && use_mul_mat_vec_nc_f16_f32 path not implemented");
+    } else if (is_split_tensor && use_mul_mat_vec_q_f16) {
+        GGML_ASSERT(false && "is_split_tensor && use_mul_mat_vec_q_f16 path not implemented");
+    } else if (is_split_tensor && use_mul_mat_q_f16) {
+        ggml_vk_op_mul_mat(ctx, subctx, cgraph, node_idx, ggml_vk_op_mul_mat_q_f16);
     } else {
-        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+        GGML_ABORT("fatal error: ggml_vk_mul_mat: unhandled case");
     }
 }
 
