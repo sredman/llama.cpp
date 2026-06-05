@@ -17,6 +17,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -71,6 +72,10 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_CREATE_EVENT,
+    RPC_CMD_RECORD_EVENT,
+    RPC_CMD_QUERY_EVENT,
+    RPC_CMD_SYNC_EVENT,
     RPC_CMD_COUNT,
 };
 
@@ -190,6 +195,39 @@ struct rpc_msg_graph_recompute_req {
     uint32_t device;
 };
 
+// Event message structures
+struct rpc_msg_create_event_req {
+    // Empty request - server generates event ID
+};
+
+struct rpc_msg_create_event_rsp {
+    int32_t event_id;
+};
+
+struct rpc_msg_record_event_req {
+    int32_t event_id;
+};
+
+struct rpc_msg_record_event_rsp {
+    uint8_t result; // 1 for success, 0 for failure
+};
+
+struct rpc_msg_query_event_req {
+    int32_t event_id;
+};
+
+struct rpc_msg_query_event_rsp {
+    uint8_t triggered; // 1 if triggered, 0 otherwise
+};
+
+struct rpc_msg_sync_event_req {
+    int32_t event_id;
+};
+
+struct rpc_msg_sync_event_rsp {
+    uint8_t result; // 1 for success, 0 for failure
+};
+
 #pragma pack(pop)
 
 // RPC data structures
@@ -215,10 +253,22 @@ struct ggml_backend_rpc_buffer_type_context {
     size_t      max_size;
 };
 
+// RPC event context - holds the event ID for tracking on the server
+struct ggml_backend_rpc_event_context {
+    int event_id;
+    std::string endpoint;
+};
+
 struct ggml_backend_rpc_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
+
+    // Event tracking for async operations
+    std::unordered_map<int, bool> events;
+    int next_event_id = 1;
+    std::mutex events_mutex;
+    int current_operation_event = -1; // Event ID for current operation
 };
 
 struct ggml_backend_rpc_buffer_context {
@@ -720,6 +770,40 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     return GGML_STATUS_SUCCESS;
 }
 
+// Forward declarations for client-side event functions
+static int rpc_create_event(const std::shared_ptr<socket_t> & sock);
+static void rpc_record_event(const std::shared_ptr<socket_t> & sock, int event_id);
+static bool rpc_query_event(const std::shared_ptr<socket_t> & sock, int event_id);
+static void rpc_sync_event(const std::shared_ptr<socket_t> & sock, int event_id);
+
+// Backend-level event functions
+static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    ggml_backend_rpc_event_context * rpc_event_ctx = (ggml_backend_rpc_event_context *)event->context;
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        return;
+    }
+    rpc_record_event(sock, rpc_event_ctx->event_id);
+    // Store the event ID for the current operation
+    {
+        std::lock_guard<std::mutex> lock(rpc_ctx->events_mutex);
+        rpc_ctx->current_operation_event = rpc_event_ctx->event_id;
+    }
+}
+
+static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    ggml_backend_rpc_event_context * rpc_event_ctx = (ggml_backend_rpc_event_context *)event->context;
+
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        return;
+    }
+    rpc_sync_event(sock, rpc_event_ctx->event_id);
+}
+
 static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_name                = */ ggml_backend_rpc_name,
     /* .free                    = */ ggml_backend_rpc_free,
@@ -734,8 +818,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_rpc_event_record,
+    /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -776,9 +860,13 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
 ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     std::string dev_name = "RPC" + std::to_string(device) + "[" + std::string(endpoint) + "]";
     ggml_backend_rpc_context * ctx = new ggml_backend_rpc_context {
-        /* .endpoint       = */ endpoint,
-        /* .device         = */ device,
-        /* .name           = */ dev_name,
+        /* .endpoint                  = */ endpoint,
+        /* .device                    = */ device,
+        /* .name                      = */ dev_name,
+        /* .events                    = */ {},
+        /* .next_event_id             = */ 1,
+        /* .events_mutex              = */ {},
+        /* .current_operation_event   = */ -1,
     };
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_t backend = new ggml_backend {
@@ -814,6 +902,39 @@ void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, 
     get_device_memory(sock, device, free, total);
 }
 
+// Client-side event management functions
+static int rpc_create_event(const std::shared_ptr<socket_t> & sock) {
+    rpc_msg_create_event_req request;
+    rpc_msg_create_event_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_CREATE_EVENT, &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    return response.event_id;
+}
+
+static void rpc_record_event(const std::shared_ptr<socket_t> & sock, int event_id) {
+    rpc_msg_record_event_req request = { event_id };
+    rpc_msg_record_event_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_RECORD_EVENT, &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    RPC_STATUS_ASSERT(response.result == 1);
+}
+
+static bool rpc_query_event(const std::shared_ptr<socket_t> & sock, int event_id) {
+    rpc_msg_query_event_req request = { event_id };
+    rpc_msg_query_event_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_QUERY_EVENT, &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    return response.triggered != 0;
+}
+
+static void rpc_sync_event(const std::shared_ptr<socket_t> & sock, int event_id) {
+    rpc_msg_sync_event_req request = { event_id };
+    rpc_msg_sync_event_rsp response;
+    bool status = send_rpc_cmd(sock, RPC_CMD_SYNC_EVENT, &request, sizeof(request), &response, sizeof(response));
+    RPC_STATUS_ASSERT(status);
+    RPC_STATUS_ASSERT(response.result == 1);
+}
+
 // RPC server-side implementation
 
 class rpc_server {
@@ -841,6 +962,12 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
 
+    // Event management
+    bool create_event(rpc_msg_create_event_rsp & response);
+    bool record_event(const rpc_msg_record_event_req & request);
+    bool query_event(const rpc_msg_query_event_req & request, rpc_msg_query_event_rsp & response);
+    bool sync_event(const rpc_msg_sync_event_req & request);
+
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -860,6 +987,12 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+
+    // Event tracking
+    std::unordered_map<int, bool> events;  // event_id -> triggered
+    int next_event_id = 1;
+    std::mutex events_mutex;
+    int current_operation_event = -1; // Event ID for current operation
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -867,6 +1000,48 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.minor = RPC_PROTO_MINOR_VERSION;
     response.patch = RPC_PROTO_PATCH_VERSION;
     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+}
+
+// Event management methods
+bool rpc_server::create_event(rpc_msg_create_event_rsp & response) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    int event_id = next_event_id++;
+    events[event_id] = false;  // Create event in "not triggered" state
+    response.event_id = event_id;
+    LOG_DBG("[%s] created event %d\n", __func__, event_id);
+    return true;
+}
+
+bool rpc_server::record_event(const rpc_msg_record_event_req & request) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    current_operation_event = request.event_id;
+    LOG_DBG("[%s] recording event %d for current operation\n", __func__, request.event_id);
+    return true;
+}
+
+bool rpc_server::query_event(const rpc_msg_query_event_req & request, rpc_msg_query_event_rsp & response) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    auto it = events.find(request.event_id);
+    if (it != events.end()) {
+        response.triggered = it->second ? 1 : 0;
+        return true;
+    }
+    response.triggered = 0;
+    return false;
+}
+
+bool rpc_server::sync_event(const rpc_msg_sync_event_req & request) {
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(events_mutex);
+            auto it = events.find(request.event_id);
+            if (it != events.end() && it->second) {
+                return true;  // Event triggered
+            }
+        }
+        // Small sleep to prevent busy waiting
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 }
 
 bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response) {
@@ -1386,6 +1561,15 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+
+    // Trigger any associated event
+    if (current_operation_event != -1) {
+        std::lock_guard<std::mutex> lock(events_mutex);
+        events[current_operation_event] = true;
+        current_operation_event = -1;
+        LOG_DBG("[%s] triggered event %d after graph compute\n", __func__, current_operation_event);
+    }
+
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1670,6 +1854,61 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_CREATE_EVENT: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                rpc_msg_create_event_rsp response;
+                if (!server.create_event(response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_RECORD_EVENT: {
+                rpc_msg_record_event_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.record_event(request)) {
+                    return;
+                }
+                rpc_msg_record_event_rsp response = {1}; // success
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_QUERY_EVENT: {
+                rpc_msg_query_event_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_query_event_rsp response;
+                if (!server.query_event(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SYNC_EVENT: {
+                rpc_msg_sync_event_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.sync_event(request)) {
+                    return;
+                }
+                rpc_msg_sync_event_rsp response = {1}; // success
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_DEVICE_MEMORY: {
                 rpc_msg_get_device_memory_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -1796,10 +2035,10 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     props->type        = ggml_backend_rpc_device_get_type(dev);
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
-        /* .async                 = */ false,
+        /* .async                 = */ true,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ true,
     };
 }
 
@@ -1835,6 +2074,49 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
     return buft_ctx->endpoint == dev_ctx->endpoint && buft_ctx->device == dev_ctx->device;
 }
 
+// RPC event context - holds the event ID for tracking on the server
+// Device-level event functions
+static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto sock = get_socket(ctx->endpoint.c_str());
+    if (sock == nullptr) {
+        return nullptr;
+    }
+
+    int event_id = rpc_create_event(sock);
+    if (event_id == -1) {
+        return nullptr;
+    }
+
+    ggml_backend_rpc_event_context * rpc_ctx = new ggml_backend_rpc_event_context{
+        /* .event_id = */ event_id,
+        /* .endpoint = */ ctx->endpoint
+    };
+
+    return new ggml_backend_event{
+        /* .device = */ dev,
+        /* .context = */ rpc_ctx
+    };
+}
+
+static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    ggml_backend_rpc_event_context * rpc_ctx = (ggml_backend_rpc_event_context *)event->context;
+    delete rpc_ctx;
+    delete event;
+}
+
+static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
+    ggml_backend_rpc_event_context * rpc_ctx = (ggml_backend_rpc_event_context *)event->context;
+
+    auto sock = get_socket(dev_ctx->endpoint.c_str());
+    if (sock == nullptr) {
+        return;
+    }
+    rpc_sync_event(sock, rpc_ctx->event_id);
+}
+
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_name             = */ ggml_backend_rpc_device_get_name,
     /* .get_description      = */ ggml_backend_rpc_device_get_description,
@@ -1848,9 +2130,9 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_rpc_device_event_new,
+    /* .event_free           = */ ggml_backend_rpc_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
 };
 
 // backend reg interface
