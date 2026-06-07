@@ -1855,7 +1855,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_CREATE_EVENT: {
-                if (!recv_msg(sock, nullptr, 0)) {
+                rpc_msg_create_event_req request;
+                if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
                 rpc_msg_create_event_rsp response;
