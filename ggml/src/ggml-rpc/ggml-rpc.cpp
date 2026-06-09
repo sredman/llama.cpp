@@ -751,19 +751,32 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
+    LOG_DBG("[%s] backend=%p, cgraph=%p, n_nodes=%d, endpoint=%s\n",
+            __func__, (void*)backend, (void*)cgraph, cgraph->n_nodes, rpc_ctx->endpoint.c_str());
+
     GGML_ASSERT(cgraph->n_nodes > 0);
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
+        LOG_DBG("[%s] using cached graph (recompute)\n", __func__);
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         auto sock = get_socket(rpc_ctx->endpoint);
+        if (sock == nullptr) {
+            LOG_DBG("[%s] WARNING: get_socket returned nullptr for endpoint %s\n", __func__, rpc_ctx->endpoint.c_str());
+            return GGML_STATUS_FAILED;
+        }
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         RPC_STATUS_ASSERT(status);
     } else {
+        LOG_DBG("[%s] serializing and sending new graph\n", __func__);
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
+        if (sock == nullptr) {
+            LOG_DBG("[%s] WARNING: get_socket returned nullptr for endpoint %s\n", __func__, rpc_ctx->endpoint.c_str());
+            return GGML_STATUS_FAILED;
+        }
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         RPC_STATUS_ASSERT(status);
     }
@@ -781,10 +794,15 @@ static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_e
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_rpc_event_context * rpc_event_ctx = (ggml_backend_rpc_event_context *)event->context;
 
+    LOG_DBG("[%s] backend=%p, event=%p, event_id=%d, endpoint=%s\n",
+            __func__, (void*)backend, (void*)event, rpc_event_ctx->event_id, rpc_ctx->endpoint.c_str());
+
     auto sock = get_socket(rpc_ctx->endpoint);
     if (sock == nullptr) {
+        LOG_DBG("[%s] WARNING: get_socket returned nullptr for endpoint %s\n", __func__, rpc_ctx->endpoint.c_str());
         return;
     }
+    LOG_DBG("[%s] sending RPC_CMD_RECORD_EVENT for event_id=%d\n", __func__, rpc_event_ctx->event_id);
     rpc_record_event(sock, rpc_event_ctx->event_id);
     // Store the event ID for the current operation
     {
@@ -797,10 +815,15 @@ static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_eve
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_rpc_event_context * rpc_event_ctx = (ggml_backend_rpc_event_context *)event->context;
 
+    LOG_DBG("[%s] backend=%p, event=%p, event_id=%d, endpoint=%s\n",
+            __func__, (void*)backend, (void*)event, rpc_event_ctx->event_id, rpc_ctx->endpoint.c_str());
+
     auto sock = get_socket(rpc_ctx->endpoint);
     if (sock == nullptr) {
+        LOG_DBG("[%s] WARNING: get_socket returned nullptr for endpoint %s\n", __func__, rpc_ctx->endpoint.c_str());
         return;
     }
+    LOG_DBG("[%s] sending RPC_CMD_SYNC_EVENT for event_id=%d\n", __func__, rpc_event_ctx->event_id);
     rpc_sync_event(sock, rpc_event_ctx->event_id);
 }
 
@@ -1008,14 +1031,14 @@ bool rpc_server::create_event(rpc_msg_create_event_rsp & response) {
     int event_id = next_event_id++;
     events[event_id] = false;  // Create event in "not triggered" state
     response.event_id = event_id;
-    LOG_DBG("[%s] created event %d\n", __func__, event_id);
+    LOG_DBG("[%s] created event %d (total events: %zu)\n", __func__, event_id, events.size());
     return true;
 }
 
 bool rpc_server::record_event(const rpc_msg_record_event_req & request) {
     std::lock_guard<std::mutex> lock(events_mutex);
     current_operation_event = request.event_id;
-    LOG_DBG("[%s] recording event %d for current operation\n", __func__, request.event_id);
+    LOG_DBG("[%s] recording event %d for current operation (previous: %d)\n", __func__, request.event_id, current_operation_event);
     return true;
 }
 
@@ -1024,18 +1047,22 @@ bool rpc_server::query_event(const rpc_msg_query_event_req & request, rpc_msg_qu
     auto it = events.find(request.event_id);
     if (it != events.end()) {
         response.triggered = it->second ? 1 : 0;
+        LOG_DBG("[%s] query event %d -> triggered: %d\n", __func__, request.event_id, response.triggered);
         return true;
     }
+    LOG_DBG("[%s] query event %d -> NOT FOUND\n", __func__, request.event_id);
     response.triggered = 0;
     return false;
 }
 
 bool rpc_server::sync_event(const rpc_msg_sync_event_req & request) {
+    LOG_DBG("[%s] START: waiting for event %d to be triggered\n", __func__, request.event_id);
     while (true) {
         {
             std::lock_guard<std::mutex> lock(events_mutex);
             auto it = events.find(request.event_id);
             if (it != events.end() && it->second) {
+                LOG_DBG("[%s] COMPLETE: event %d triggered\n", __func__, request.event_id);
                 return true;  // Event triggered
             }
         }
@@ -1564,10 +1591,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 
     // Trigger any associated event
     if (current_operation_event != -1) {
-        std::lock_guard<std::mutex> lock(events_mutex);
-        events[current_operation_event] = true;
-        current_operation_event = -1;
-        LOG_DBG("[%s] triggered event %d after graph compute\n", __func__, current_operation_event);
+        int event_to_trigger = current_operation_event;
+        {
+            std::lock_guard<std::mutex> lock(events_mutex);
+            events[event_to_trigger] = true;
+            current_operation_event = -1;
+        }
+        LOG_DBG("[%s] triggered event %d after graph compute\n", __func__, event_to_trigger);
     }
 
     stored_graphs[device].graph = graph;
@@ -1586,6 +1616,17 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+
+    // Trigger any associated event
+    if (current_operation_event != -1) {
+        int event_to_trigger = current_operation_event;
+        {
+            std::lock_guard<std::mutex> lock(events_mutex);
+            events[event_to_trigger] = true;
+            current_operation_event = -1;
+        }
+        LOG_DBG("[%s] triggered event %d after graph recompute\n", __func__, event_to_trigger);
+    }
     return true;
 }
 
@@ -2079,15 +2120,21 @@ static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_b
 // Device-level event functions
 static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    LOG_DBG("[%s] dev=%p, endpoint=%s\n", __func__, (void*)dev, ctx->endpoint.c_str());
+
     auto sock = get_socket(ctx->endpoint.c_str());
     if (sock == nullptr) {
+        LOG_DBG("[%s] WARNING: get_socket returned nullptr for endpoint %s\n", __func__, ctx->endpoint.c_str());
         return nullptr;
     }
 
     int event_id = rpc_create_event(sock);
     if (event_id == -1) {
+        LOG_DBG("[%s] WARNING: rpc_create_event returned -1\n", __func__);
         return nullptr;
     }
+
+    LOG_DBG("[%s] created event_id=%d\n", __func__, event_id);
 
     ggml_backend_rpc_event_context * rpc_ctx = new ggml_backend_rpc_event_context{
         /* .event_id = */ event_id,
@@ -2111,10 +2158,15 @@ static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, gg
     ggml_backend_rpc_device_context * dev_ctx = (ggml_backend_rpc_device_context *)dev->context;
     ggml_backend_rpc_event_context * rpc_ctx = (ggml_backend_rpc_event_context *)event->context;
 
+    LOG_DBG("[%s] dev=%p, event=%p, event_id=%d, endpoint=%s\n",
+            __func__, (void*)dev, (void*)event, rpc_ctx->event_id, dev_ctx->endpoint.c_str());
+
     auto sock = get_socket(dev_ctx->endpoint.c_str());
     if (sock == nullptr) {
+        LOG_DBG("[%s] WARNING: get_socket returned nullptr for endpoint %s\n", __func__, dev_ctx->endpoint.c_str());
         return;
     }
+    LOG_DBG("[%s] sending RPC_CMD_SYNC_EVENT for event_id=%d\n", __func__, rpc_ctx->event_id);
     rpc_sync_event(sock, rpc_ctx->event_id);
 }
 
