@@ -3088,11 +3088,20 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ true,
-        /* .host_buffer           = */ false,
+        /* .host_buffer           = */ true,
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ true,
-        /* .mmap_support          = */ true,
+        // an mmap of the GGUF is never consumed locally on RPC peers, only copied to the socket,
+        // where fault-driven streaming is slower than a staged upload; let auto pick the staged path
+        /* .mmap_support          = */ false,
     };
+}
+
+static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+    // TCP transport stages uploads through ordinary host memory
+    GGML_UNUSED(dev);
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    return cpu != nullptr ? ggml_backend_dev_buffer_type(cpu) : nullptr;
 }
 
 static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
@@ -3162,7 +3171,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_props            = */ ggml_backend_rpc_device_get_props,
     /* .init_backend         = */ ggml_backend_rpc_device_init,
     /* .get_buffer_type      = */ ggml_backend_rpc_device_get_buffer_type,
-    /* .get_host_buffer_type = */ NULL,
+    /* .get_host_buffer_type = */ ggml_backend_rpc_device_get_host_buffer_type,
     /* .buffer_from_host_ptr = */ NULL,
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
