@@ -8,11 +8,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <future>
+#include <mutex>
 #include <regex>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 static const size_t kiB = 1024;
@@ -1672,89 +1677,94 @@ bool llama_model_loader::load_all_data(
     // Buffer size: balance between memory usage and I/O efficiency
     const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
 
-    std::vector<ggml_backend_buffer_t> host_buffers;
-    std::vector<ggml_backend_event_t> events;
-    std::vector<void *> host_ptrs;
-    size_t buffer_idx = 0; // buffer to use for async loads
-    ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
-            return nullptr;
-        }
-        // When not using mmaped io use async uploads from pinned memory to GPU memory.
-        // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.empty() ? nullptr : bufs[0];
-        if (!buf) {
-            LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
-            return nullptr;
-        }
+    // one staging pipeline per device holding weights: a pinned ring with completion events.
+    // each pipeline is fed by its own thread, so a slow backend only idles its own queue instead
+    // of the single producer that serialized the whole fan-out before
+    struct upload_pipeline {
+        ggml_backend_t        backend = nullptr;
+        ggml_backend_buffer_t host_buffers[n_buffers] = {};
+        ggml_backend_event_t  events[n_buffers] = {};
+        void *                host_ptrs[n_buffers] = {};
+        size_t                buffer_idx = 0;
+    };
+    std::vector<upload_pipeline> pipes;
+    std::unordered_map<ggml_backend_buffer_t, size_t> pipe_of_buf;
 
-        auto * buft = ggml_backend_buffer_get_type(buf);
-        auto * dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            LLAMA_LOG_DEBUG("%s: no device found for buffer type %s for async uploads\n", func,
-                ggml_backend_buft_name(buft));
-            return nullptr;
-        }
-
-        if (buft != ggml_backend_dev_buffer_type(dev)) {
-            LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
-                ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        if (!props.caps.async || !props.caps.host_buffer || !props.caps.events) {
-            LLAMA_LOG_DEBUG("%s: device %s does not support async, host buffers or events\n", func,
-                ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
-        if (!host_buft) {
-            LLAMA_LOG_DEBUG("%s: no host buffer type found for device %s\n", func,
-                ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        // If the backend is supported, create pinned memory buffers and events for synchronisation.
-        for (size_t idx = 0; idx < n_buffers; ++idx) {
-            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
-
-            if (!buf) {
-                LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
-                    ggml_backend_dev_name(dev));
-                return nullptr;
+    if (!use_mmap && !check_tensors) {
+        for (auto * buf : bufs) {
+            if (buf == nullptr || ggml_backend_buffer_is_host(buf) || pipe_of_buf.count(buf) != 0) {
+                continue;
             }
-
-            host_buffers.emplace_back(buf);
-            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
-
-            auto * event = ggml_backend_event_new(dev);
-            if (!event) {
-                LLAMA_LOG_DEBUG("%s: failed to create event for async uploads for device %s\n", func,
-                    ggml_backend_dev_name(dev));
-                return nullptr;
+            auto * buft = ggml_backend_buffer_get_type(buf);
+            auto * dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr || buft != ggml_backend_dev_buffer_type(dev)) {
+                LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type of its device, its tensors load synchronously\n",
+                    __func__, ggml_backend_buft_name(buft));
+                continue;
             }
-
-            events.emplace_back(event);
+            size_t pipe_idx = 0;
+            bool found = false;
+            for (size_t pi = 0; pi < pipes.size(); ++pi) {
+                if (ggml_backend_get_device(pipes[pi].backend) == dev) {
+                    pipe_idx = pi;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+                if (!props.caps.async || !props.caps.host_buffer || !props.caps.events || !host_buft) {
+                    LLAMA_LOG_DEBUG("%s: device %s does not support async, host buffers or events, its tensors load synchronously\n",
+                        __func__, ggml_backend_dev_name(dev));
+                    continue;
+                }
+                upload_pipeline pipe;
+                pipe.backend = ggml_backend_dev_init(dev, nullptr);
+                bool ok = pipe.backend != nullptr;
+                for (size_t idx = 0; idx < n_buffers && ok; ++idx) {
+                    auto * hbuf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+                    if (!hbuf) {
+                        LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n",
+                            __func__, ggml_backend_dev_name(dev));
+                        ok = false;
+                        break;
+                    }
+                    pipe.host_buffers[idx] = hbuf;
+                    pipe.host_ptrs[idx] = ggml_backend_buffer_get_base(hbuf);
+                    auto * event = ggml_backend_event_new(dev);
+                    if (!event) {
+                        LLAMA_LOG_DEBUG("%s: failed to create event for async uploads for device %s\n",
+                            __func__, ggml_backend_dev_name(dev));
+                        ok = false;
+                        break;
+                    }
+                    pipe.events[idx] = event;
+                }
+                if (!ok) {
+                    for (auto * b : pipe.host_buffers) {
+                        if (b) {
+                            ggml_backend_buffer_free(b);
+                        }
+                    }
+                    for (auto * e : pipe.events) {
+                        if (e) {
+                            ggml_backend_event_free(e);
+                        }
+                    }
+                    if (pipe.backend) {
+                        ggml_backend_free(pipe.backend);
+                    }
+                    continue;
+                }
+                LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s\n", __func__,
+                    ggml_backend_dev_name(dev), ggml_backend_buft_name(buft));
+                pipes.emplace_back(pipe);
+                pipe_idx = pipes.size() - 1;
+            }
+            pipe_of_buf[buf] = pipe_idx;
         }
-
-        ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-        if (!backend) {
-            LLAMA_LOG_DEBUG("%s: failed to initialize backend for device %s for async uploads\n", func,
-                ggml_backend_dev_name(dev));
-            return nullptr;
-        }
-
-        return backend;
-    }(__func__);
-
-    if (upload_backend) {
-        LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
-            ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs[0])),
-            ggml_backend_name(upload_backend));
     }
 
     std::vector<ggml_tensor *> tensors;
@@ -1775,20 +1785,148 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // bucket tensors by pipeline so each device is fed by a single staging thread;
+    // everything else (mmap, lazy, host tensors, devices without async support) stays in the serial loop
+    std::vector<std::vector<ggml_tensor *>> staged(pipes.size());
+    std::vector<ggml_tensor *> serial_tensors;
+    for (struct ggml_tensor * cur : tensors) {
+        const auto * weight = get_weight(ggml_get_name(cur));
+        const auto pipe = weight != nullptr && !lazy.has(cur) && cur->buffer != nullptr
+            ? pipe_of_buf.find(cur->buffer)
+            : pipe_of_buf.end();
+        if (pipe != pipe_of_buf.end()) {
+            staged[pipe->second].push_back(cur);
+        } else {
+            serial_tensors.push_back(cur);
+        }
+    }
+    tensors.clear();
+
+    std::mutex progress_mutex;
+    std::atomic<bool> cancelled{false};
+
+    auto report_progress = [&]() {
+        if (!progress_callback) {
+            return;
+        }
+        const std::lock_guard<std::mutex> lock(progress_mutex);
+        if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+            cancelled = true;
+        }
+    };
+
+    // read the tensor through the pipeline's ring, handing each full slot to the backend asynchronously
+    auto stage_tensor = [&](upload_pipeline & pipe, ggml_tensor * cur, const llama_tensor_weight * weight, llama_file & file) {
+        const size_t n_size                = ggml_nbytes(cur);
+        const size_t alignment             = file.read_alignment();
+        const size_t aligned_offset        = weight->offs & ~(alignment - 1);
+        const size_t offset_from_alignment = weight->offs - aligned_offset;
+        const size_t read_end              = (weight->offs + n_size + alignment - 1) & ~(alignment - 1);
+
+        file.seek(aligned_offset, SEEK_SET);
+
+        size_t bytes_read = 0;
+        size_t data_read = 0;
+
+        while (bytes_read < read_end - aligned_offset) {
+            const size_t read_size = std::min<size_t>(buffer_size, read_end - aligned_offset - bytes_read);
+
+            // align the destination pointer within the staging buffer
+            uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(pipe.host_ptrs[pipe.buffer_idx]) + alignment - 1) & ~(alignment - 1);
+
+            // wait for the previous upload from this slot before overwriting it
+            ggml_backend_event_synchronize(pipe.events[pipe.buffer_idx]);
+
+            file.read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+
+            uintptr_t ptr_data = ptr_dest_aligned;
+            size_t data_to_copy = read_size;
+
+            if (bytes_read == 0) {
+                ptr_data += offset_from_alignment;
+                data_to_copy -= offset_from_alignment;
+            }
+
+            if (aligned_offset + bytes_read + read_size > weight->offs + n_size) {
+                data_to_copy -= (read_end - (weight->offs + n_size));
+            }
+
+            ggml_backend_tensor_set_async(pipe.backend, cur, reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+            ggml_backend_event_record(pipe.events[pipe.buffer_idx], pipe.backend);
+
+            data_read += data_to_copy;
+            bytes_read += read_size;
+
+            ++pipe.buffer_idx;
+            pipe.buffer_idx %= n_buffers;
+        }
+    };
+
+    auto run_pipe = [&](upload_pipeline & pipe, std::vector<ggml_tensor *> & list) {
+        // a reopened file gives this thread its own read cursor
+        std::vector<std::unique_ptr<llama_file>> pipe_files(files.size());
+        for (ggml_tensor * cur : list) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (weight == nullptr) {
+                continue;
+            }
+            report_progress();
+            if (cancelled) {
+                return;
+            }
+            if (!pipe_files[weight->idx]) {
+                pipe_files[weight->idx] = files[weight->idx]->reopen();
+                if (!pipe_files[weight->idx]) {
+                    throw std::runtime_error("failed to reopen the model file for staged uploads");
+                }
+            }
+            stage_tensor(pipe, cur, weight, *pipe_files[weight->idx]);
+            const std::lock_guard<std::mutex> lock(progress_mutex);
+            size_done += ggml_nbytes(cur);
+        }
+    };
+
+    std::vector<std::thread> workers;
+    std::vector<std::exception_ptr> pipe_errors(pipes.size());
+    for (size_t pi = 1; pi < pipes.size(); ++pi) {
+        workers.emplace_back([&, pi] {
+            try {
+                run_pipe(pipes[pi], staged[pi]);
+            } catch (...) {
+                pipe_errors[pi] = std::current_exception();
+            }
+        });
+    }
+    // join the staging threads on every exit path, including exceptions
+    struct thread_joiner {
+        std::vector<std::thread> & threads;
+        ~thread_joiner() {
+            for (auto & t : threads) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+        }
+    } joiner{workers};
+
+    // the first pipeline is staged on the main thread while the rest run on their own
+    if (!pipes.empty()) {
+        run_pipe(pipes[0], staged[0]);
+    }
+
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     // allocated from the CPU buffer type, which uses vm_allocate on Apple platforms, so freeing it returns its pages to the OS right away
     ggml_backend_buffer_ptr read_buf;
-    for (struct ggml_tensor * cur : tensors) {
+    for (struct ggml_tensor * cur : serial_tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
         }
 
-        if (progress_callback) {
-            if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
-                return false;
-            }
+        report_progress();
+        if (cancelled) {
+            break;
         }
 
         size_t n_size = ggml_nbytes(cur);
@@ -1843,102 +1981,66 @@ bool llama_model_loader::load_all_data(
                     }));
                 }
             } else {
-                // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
-                    size_t offset = weight->offs;
-                    alignment = file->read_alignment();
-                    size_t aligned_offset = offset & ~(alignment - 1);
-                    size_t offset_from_alignment = offset - aligned_offset;
-                    file->seek(aligned_offset, SEEK_SET);
+                // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
+                const size_t align          = file->read_alignment();
+                const size_t aligned_offset = weight->offs & ~(align - 1);
+                const size_t pad            = weight->offs - aligned_offset;
+                const size_t read_size      = (pad + n_size + align - 1) & ~(align - 1);
+                const size_t buf_size       = read_size + align - 1;
 
-                    // Calculate aligned read boundaries
-                    size_t read_start = aligned_offset;
-                    size_t read_end = (offset + n_size + alignment - 1) & ~(alignment - 1);
-
-                    size_t bytes_read = 0;
-                    size_t data_read = 0;  // Actual tensor data copied (excluding padding)
-
-                    while (bytes_read < read_end - read_start) {
-                        size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
-
-                        // Align the destination pointer within the pinned buffer
-                        uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
-
-                        // Wait for previous upload to complete before reusing buffer
-                        ggml_backend_event_synchronize(events[buffer_idx]);
-
-                        // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
-
-                        // Calculate actual data portion (excluding alignment padding)
-                        uintptr_t ptr_data = ptr_dest_aligned;
-                        size_t data_to_copy = read_size;
-
-                        // Skip alignment padding at start of first chunk
-                        if (bytes_read == 0) {
-                            ptr_data += offset_from_alignment;
-                            data_to_copy -= offset_from_alignment;
-                        }
-
-                        // Trim alignment padding at end of last chunk
-                        if (aligned_offset + bytes_read + read_size > offset + n_size) {
-                            data_to_copy -= (read_end - (offset + n_size));
-                        }
-
-                        // Async upload actual data to GPU
-                        ggml_backend_tensor_set_async(upload_backend, cur,
-                                                      reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
-                        ggml_backend_event_record(events[buffer_idx], upload_backend);
-
-                        data_read += data_to_copy;
-                        bytes_read += read_size;
-
-                        ++buffer_idx;
-                        buffer_idx %= n_buffers;
+                // tensors come biggest-first: shrink the buffer when it gets too large, so peak memory stays close to one tensor
+                const size_t read_buf_size = read_buf ? ggml_backend_buffer_get_size(read_buf.get()) : 0;
+                if (!read_buf || read_buf_size < buf_size || read_buf_size > 2*buf_size) {
+                    // free the old buffer first, so only one is alive
+                    read_buf.reset();
+                    read_buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), buf_size));
+                    if (!read_buf) {
+                        throw std::runtime_error(format("failed to allocate a %zu-byte staging buffer", buf_size));
                     }
-                } else {
-                    // with direct IO read the aligned range around the tensor and use the data inside it, so no bounce buffer is needed
-                    const size_t align          = file->read_alignment();
-                    const size_t aligned_offset = weight->offs & ~(align - 1);
-                    const size_t pad            = weight->offs - aligned_offset;
-                    const size_t read_size      = (pad + n_size + align - 1) & ~(align - 1);
-                    const size_t buf_size       = read_size + align - 1;
+                }
+                uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(read_buf.get()), align);
+                file->seek(aligned_offset, SEEK_SET);
+                file->read_raw_unsafe(read_dst, read_size);
 
-                    // tensors come biggest-first: shrink the buffer when it gets too large, so peak memory stays close to one tensor
-                    const size_t read_buf_size = read_buf ? ggml_backend_buffer_get_size(read_buf.get()) : 0;
-                    if (!read_buf || read_buf_size < buf_size || read_buf_size > 2*buf_size) {
-                        // free the old buffer first, so only one is alive
-                        read_buf.reset();
-                        read_buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), buf_size));
-                        if (!read_buf) {
-                            throw std::runtime_error(format("failed to allocate a %zu-byte staging buffer", buf_size));
-                        }
-                    }
-                    uint8_t * read_dst = (uint8_t *) GGML_PAD((uintptr_t) ggml_backend_buffer_get_base(read_buf.get()), align);
-                    file->seek(aligned_offset, SEEK_SET);
-                    file->read_raw_unsafe(read_dst, read_size);
-
-                    const uint8_t * data = read_dst + pad;
-                    ggml_backend_tensor_set(cur, data, 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
-                    }
+                const uint8_t * data = read_dst + pad;
+                ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (check_tensors && !ggml_validate_row_data(cur->type, data, n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                 }
             }
         }
 
-        size_done += n_size;
+        {
+            const std::lock_guard<std::mutex> lock(progress_mutex);
+            size_done += n_size;
+        }
+    }
+
+    // the joiner waits for the extra staging threads even on error paths
+    for (auto & worker : workers) {
+        worker.join();
     }
 
     // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
+    for (auto & pipe : pipes) {
+        for (auto * event : pipe.events) {
+            ggml_backend_event_synchronize(event);
+            ggml_backend_event_free(event);
+        }
+        for (auto * buf : pipe.host_buffers) {
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_backend_free(pipe.backend);
     }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
+
+    if (cancelled) {
+        return false;
     }
-    ggml_backend_free(upload_backend);
+    for (const auto & ep : pipe_errors) {
+        if (ep) {
+            std::rethrow_exception(ep);
+        }
+    }
 
     // check validation results
     bool validation_failed = false;

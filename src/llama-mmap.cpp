@@ -92,7 +92,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fname(fname) {
+    impl(const char * fname, const char * mode, const bool use_direct_io = false) : fname(fname), mode(mode), direct_io(use_direct_io) {
         init_buffered_io(mode);
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
             DWORD error = ERROR_SUCCESS;
@@ -403,8 +403,10 @@ struct llama_file::impl {
         }
     }
     std::string fname;
+    std::string mode;
+    bool direct_io = false;
 #else
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname), mode(mode), direct_io(use_direct_io) {
 #ifdef __linux__
         // Try unbuffered I/O for read only
         if (use_direct_io && std::strcmp(mode, "rb") == 0) {
@@ -630,6 +632,8 @@ struct llama_file::impl {
     }
     int fd = -1;
     std::string fname;
+    std::string mode;
+    bool direct_io = false;
 #endif
 
     size_t read_alignment() const {
@@ -647,6 +651,13 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
     pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {}
 
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+
+std::unique_ptr<llama_file> llama_file::reopen() const {
+    if (pimpl->mode.empty()) {
+        return nullptr;
+    }
+    return std::make_unique<llama_file>(pimpl->fname.c_str(), pimpl->mode.c_str(), pimpl->direct_io);
+}
 
 llama_file::~llama_file() = default;
 

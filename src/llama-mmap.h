@@ -27,6 +27,9 @@ struct llama_file {
 
     int file_id() const; // fileno overload
 
+    // a second handle over the same file with its own read cursor; nullptr for FILE*-based files
+    std::unique_ptr<llama_file> reopen() const;
+
     void seek(size_t offset, int whence) const;
 
     void read_raw(void * ptr, size_t len);
