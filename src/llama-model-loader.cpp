@@ -9,9 +9,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <future>
 #include <mutex>
@@ -19,6 +22,10 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+#ifndef _WIN32
+#include <unistd.h> // ::pread for staging read-ahead
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1677,6 +1684,39 @@ bool llama_model_loader::load_all_data(
     // Buffer size: balance between memory usage and I/O efficiency
     const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
 
+    // staging read-ahead: extra threads fill ring slots with positional reads while the submit
+    // loop waits, so a device can keep several storage operations in flight instead of one
+    size_t n_readers = 0;
+#ifndef _WIN32
+    n_readers = std::min<size_t>(4, n_buffers);
+    if (const char * e = getenv("LLAMA_RING_READERS")) {
+        n_readers = std::max<size_t>(0, std::strtoul(e, nullptr, 10));
+    }
+#endif
+
+    struct pipe_readahead {
+        struct job {
+            int           fd       = -1;
+            size_t        file_off = 0;
+            size_t        read_len = 0;
+            uintptr_t     dest     = 0;
+            size_t        pad      = 0;
+            ggml_tensor * tensor   = nullptr;
+            size_t        data_off = 0;
+            size_t        data_len = 0;
+            bool          filled   = false;
+            bool          failed   = false;
+        };
+        job                     jobs[n_buffers];
+        std::deque<size_t>      todo;
+        std::mutex              mtx;
+        std::condition_variable cv_jobs;
+        std::condition_variable cv_done;
+        std::vector<std::thread> readers;
+        std::exception_ptr      error;
+        bool                    stop = false;
+    };
+
     // one staging pipeline per device holding weights: a pinned ring with completion events.
     // each pipeline is fed by its own thread, so a slow backend only idles its own queue instead
     // of the single producer that serialized the whole fan-out before
@@ -1686,6 +1726,7 @@ bool llama_model_loader::load_all_data(
         ggml_backend_event_t  events[n_buffers] = {};
         void *                host_ptrs[n_buffers] = {};
         size_t                buffer_idx = 0;
+        std::unique_ptr<pipe_readahead> ra;
     };
     std::vector<upload_pipeline> pipes;
     std::unordered_map<ggml_backend_buffer_t, size_t> pipe_of_buf;
@@ -1758,9 +1799,12 @@ bool llama_model_loader::load_all_data(
                     }
                     continue;
                 }
+                if (n_readers > 0) {
+                    pipe.ra = std::make_unique<pipe_readahead>();
+                }
                 LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s\n", __func__,
                     ggml_backend_dev_name(dev), ggml_backend_buft_name(buft));
-                pipes.emplace_back(pipe);
+                pipes.emplace_back(std::move(pipe));
                 pipe_idx = pipes.size() - 1;
             }
             pipe_of_buf[buf] = pipe_idx;
@@ -1862,9 +1906,156 @@ bool llama_model_loader::load_all_data(
         }
     };
 
+#ifndef _WIN32
+    // one read-ahead worker: pops slots from the pipeline's todo list and fills them with positional
+    // reads, mirroring the EOF zero-fill and short-read handling of llama_file::read_raw_unsafe
+    auto readahead_reader = [](upload_pipeline & pipe) {
+        pipe_readahead & ra = *pipe.ra;
+        try {
+            for (;;) {
+                size_t s;
+                {
+                    std::unique_lock<std::mutex> lock(ra.mtx);
+                    ra.cv_jobs.wait(lock, [&] { return ra.stop || !ra.todo.empty(); });
+                    if (ra.stop) {
+                        return;
+                    }
+                    s = ra.todo.front();
+                    ra.todo.pop_front();
+                }
+                pipe_readahead::job & j = ra.jobs[s];
+                size_t have = 0;
+                bool ok = true;
+                while (have < j.read_len) {
+                    ssize_t r = ::pread(j.fd, reinterpret_cast<void *>(j.dest + have), j.read_len - have,
+                                        j.file_off + have);
+                    if (r < 0) {
+                        if (errno == EINTR) {
+                            continue;
+                        }
+                        ok = false;
+                        break;
+                    }
+                    if (r == 0) {
+                        std::memset(reinterpret_cast<void *>(j.dest + have), 0, j.read_len - have);
+                        break;
+                    }
+                    have += (size_t) r;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(ra.mtx);
+                    j.filled = ok;
+                    j.failed = !ok;
+                }
+                ra.cv_done.notify_one();
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(ra.mtx);
+            ra.error = std::current_exception();
+        }
+        ra.cv_done.notify_all();
+    };
+
+    // same staging loop, but the next n_buffers-1 slot reads run on the read-ahead threads while the
+    // submitter waits for the current slot, so the device sees several outstanding operations
+    auto stage_tensor_ahead = [&](upload_pipeline & pipe, ggml_tensor * cur, const llama_tensor_weight * weight,
+                                  llama_file & file) {
+        const size_t n_size                = ggml_nbytes(cur);
+        const size_t alignment             = file.read_alignment();
+        const size_t aligned_offset        = weight->offs & ~(alignment - 1);
+        const size_t offset_from_alignment = weight->offs - aligned_offset;
+        const size_t read_end              = (weight->offs + n_size + alignment - 1) & ~(alignment - 1);
+        const int    fd                    = file.file_id();
+        const size_t total                 = (read_end - aligned_offset + buffer_size - 1) / buffer_size;
+        pipe_readahead & ra = *pipe.ra;
+
+        size_t issued = 0;
+        size_t plan_bytes = 0;
+        size_t plan_data = 0;
+
+        for (size_t sent = 0; sent < total; ++sent) {
+            while (issued < total && issued - sent < n_buffers) {
+                const size_t s = issued % n_buffers;
+                if (issued >= n_buffers) {
+                    // the slot becomes reusable once its previous upload left the socket
+                    ggml_backend_event_synchronize(pipe.events[s]);
+                }
+                const size_t read_size = std::min(buffer_size, read_end - aligned_offset - plan_bytes);
+                uintptr_t dest = (reinterpret_cast<uintptr_t>(pipe.host_ptrs[s]) + alignment - 1) & ~(alignment - 1);
+                size_t data_len = read_size;
+                if (plan_bytes == 0) {
+                    data_len -= offset_from_alignment;
+                }
+                if (aligned_offset + plan_bytes + read_size > weight->offs + n_size) {
+                    data_len -= (read_end - (weight->offs + n_size));
+                }
+                {
+                    std::lock_guard<std::mutex> lock(ra.mtx);
+                    pipe_readahead::job & j = ra.jobs[s];
+                    j.fd = fd;
+                    j.file_off = aligned_offset + plan_bytes;
+                    j.read_len = read_size;
+                    j.dest = dest;
+                    j.pad = plan_bytes == 0 ? offset_from_alignment : 0;
+                    j.tensor = cur;
+                    j.data_off = plan_data;
+                    j.data_len = data_len;
+                    j.filled = false;
+                    j.failed = false;
+                    ra.todo.push_back(s);
+                }
+                ra.cv_jobs.notify_one();
+                plan_bytes += read_size;
+                plan_data += data_len;
+                ++issued;
+            }
+
+            const size_t s = sent % n_buffers;
+            {
+                std::unique_lock<std::mutex> lock(ra.mtx);
+                ra.cv_done.wait(lock, [&] { return ra.jobs[s].filled || ra.jobs[s].failed || ra.error != nullptr; });
+                if (ra.error) {
+                    std::rethrow_exception(ra.error);
+                }
+                if (ra.jobs[s].failed) {
+                    throw std::runtime_error("staged read-ahead failed to read the model file");
+                }
+            }
+            const pipe_readahead::job & j = ra.jobs[s];
+            ggml_backend_tensor_set_async(pipe.backend, j.tensor, reinterpret_cast<void *>(j.dest + j.pad),
+                                          j.data_off, j.data_len);
+            ggml_backend_event_record(pipe.events[s], pipe.backend);
+        }
+    };
+#endif
+
     auto run_pipe = [&](upload_pipeline & pipe, std::vector<ggml_tensor *> & list) {
         // a reopened file gives this thread its own read cursor
         std::vector<std::unique_ptr<llama_file>> pipe_files(files.size());
+#ifndef _WIN32
+        struct reader_joiner {
+            pipe_readahead * ra;
+            ~reader_joiner() {
+                if (ra == nullptr) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(ra->mtx);
+                    ra->stop = true;
+                }
+                ra->cv_jobs.notify_all();
+                for (auto & t : ra->readers) {
+                    t.join();
+                }
+            }
+        };
+        if (pipe.ra) {
+            for (size_t i = 0; i < n_readers; ++i) {
+                pipe.ra->readers.emplace_back(readahead_reader, std::ref(pipe));
+            }
+        }
+        reader_joiner joiner{pipe.ra ? pipe.ra.get() : nullptr};
+#endif
         for (ggml_tensor * cur : list) {
             const auto * weight = get_weight(ggml_get_name(cur));
             if (weight == nullptr) {
@@ -1880,7 +2071,15 @@ bool llama_model_loader::load_all_data(
                     throw std::runtime_error("failed to reopen the model file for staged uploads");
                 }
             }
+#ifndef _WIN32
+            if (pipe.ra) {
+                stage_tensor_ahead(pipe, cur, weight, *pipe_files[weight->idx]);
+            } else {
+                stage_tensor(pipe, cur, weight, *pipe_files[weight->idx]);
+            }
+#else
             stage_tensor(pipe, cur, weight, *pipe_files[weight->idx]);
+#endif
             const std::lock_guard<std::mutex> lock(progress_mutex);
             size_done += ggml_nbytes(cur);
         }
