@@ -719,8 +719,9 @@ struct llama_mmap::impl {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        // MAP_POPULATE would fault in the lazy ranges too
-        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+        // no MAP_POPULATE: it reads the whole file synchronously before returning, which
+        // blocks consumers (e.g. RPC tensor upload) until every page is resident. the
+        // POSIX_MADV_WILLNEED below schedules the same readahead asynchronously instead
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
